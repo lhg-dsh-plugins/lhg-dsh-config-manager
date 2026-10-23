@@ -1,0 +1,571 @@
+/**
+ * Phase 3 Reconciler 单测（node:test，零依赖）。
+ * 覆盖：corrupt→quarantine、env 不匹配、terminal 遗留→organized、all-done→recovered、
+ * no-apply→noop、external half-install→needs-attention、live owner 跳过、startup
+ * stale→RECOVERY_REQUIRED(不自动 recover)、executeRecovery 无确认无副作用、幂等。
+ */
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import fssync from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { JournalStore, createJournalEntry, type OperationJournal, type JournalStep } from './journal.ts';
+import { Phase3Recovery, safeModeMarkerPath } from './phase3-host.ts';
+import {
+  reconcileActive, executeRecovery, inspectStartup, recomputeRecoveryDecision,
+  type ReconcileProbeHooks, type ReconcileEnv,
+} from './reconcile.ts';
+
+function tmp(t: test.TestContext): string {
+  const dir = fssync.mkdtempSync(path.join(os.tmpdir(), 'rec-'));
+  t.after(() => fssync.rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+const FP = 'fp-rec';
+function mkStore(dir: string) { return new JournalStore({ transactionsDir: path.join(dir, 'transactions') }); }
+
+function op(id: string, state?: OperationJournal['state']): OperationJournal {
+  const j = createJournalEntry('import-apply', { operationId: id, ownerInstanceId: 'o1', lockId: 'l1', packageVersion: '0.1.54', environmentFingerprint: FP }, '2026-01-01T00:00:00.000Z');
+  if (state !== undefined) j.state = state;
+  return j;
+}
+
+function fileStep(status: JournalStep['status']): JournalStep {
+  return { adapter: 'skills', ref: 'a.md', kind: 'Update', external: false, beforeFp: 'before', afterFp: 'after-a.md', status, appliedAt: null };
+}
+function extStep(status: JournalStep['status']): JournalStep {
+  return { adapter: 'plugins', ref: 'plugin:@x', kind: 'Install', external: true, beforeFp: null, afterFp: null, status, appliedAt: null };
+}
+
+function hooks(over: Partial<ReconcileProbeHooks> = {}): ReconcileProbeHooks {
+  return {
+    verifyStepFingerprint: async (s) => (s.status === 'done' ? 'after-match' : 'before-match'),
+    probeExternal: async () => 'not-installed',
+    snapshotExists: async () => true,
+    ...over,
+  };
+}
+const env: ReconcileEnv = { environmentFingerprint: FP, isLiveOwner: async () => false };
+
+// ---------- 决策测试 ----------
+
+test('corrupt journal → quarantine + SAFE MODE', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  await store.ensureDirs();
+  const badId = '00000000-0000-4000-8000-0000000000c1';
+  await fs.writeFile(path.join(dir, 'transactions', 'active', `${badId}.json`), 'not-json{{{');
+  const out = await reconcileActive(store, hooks(), env);
+  assert.equal(out.decisions[0]!.kind, 'corrupt');
+  assert.equal(out.safeModeRequired, true);
+  assert.equal(await store.readSafeMode(), true);
+  // 已隔离
+  assert.ok((await fs.readdir(path.join(dir, 'transactions', 'quarantine'))).length > 0);
+  assert.deepEqual(await store.scanActive(), []);
+});
+
+test('environment 不匹配 → env-mismatch / SAFE MODE（不恢复）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000c2';
+  await store.create({ ...op(id, 'APPLYING'), environmentFingerprint: 'OTHER-MACHINE' });
+  const out = await reconcileActive(store, hooks(), env);
+  assert.equal(out.decisions[0]!.kind, 'env-mismatch');
+  assert.equal(out.safeModeRequired, true);
+});
+
+test('terminal 遗留 active → organized（move 到 completed，无实质 recovery）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000c3';
+  await store.create(op(id, 'CREATED'));
+  await store.update(id, (j) => ({ ...j, state: 'COMMITTED' }));
+  const out = await reconcileActive(store, hooks(), env);
+  assert.equal(out.decisions[0]!.kind, 'organized');
+  assert.equal(out.safeModeRequired, false);
+  assert.deepEqual(await store.scanActive(), []);
+});
+
+test('所有 step 已 done（afterFp 确认）→ recovered（resume 不重做）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000c4';
+  const j = op(id, 'APPLYING');
+  j.plannedSteps = ['s1'];
+  j.steps = { s1: fileStep('done') };
+  await store.create(j);
+  const out = await reconcileActive(store, hooks(), env);
+  assert.equal(out.decisions[0]!.kind, 'recovered');
+  assert.equal((await store.load(id))?.state, 'RECOVERED');
+  assert.deepEqual(await store.scanActive(), []);
+});
+
+test('外部 half-installed → needs-attention / SAFE MODE（绝不自动 cleanup）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000c5';
+  const j = op(id, 'APPLYING');
+  j.plannedSteps = ['p1'];
+  j.steps = { p1: extStep('planned') };
+  await store.create(j);
+  const out = await reconcileActive(store, { verifyStepFingerprint: async () => 'before-match', probeExternal: async () => 'half-installed', snapshotExists: async () => true }, env);
+  assert.equal(out.decisions[0]!.kind, 'needs-attention');
+  assert.equal(out.safeModeRequired, true);
+});
+
+test('no step applied（全 beforeFp）→ noop（安全丢弃）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000c6';
+  const j = op(id, 'APPLYING');
+  j.plannedSteps = ['s1'];
+  j.steps = { s1: fileStep('planned') }; // verifyStepFingerprint 默认 before-match
+  await store.create(j);
+  const out = await reconcileActive(store, hooks(), env);
+  assert.equal(out.decisions[0]!.kind, 'noop');
+  assert.equal(out.safeModeRequired, false);
+});
+
+test('live owner → live 跳过（不 reconcile/quarantine/move）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000c7';
+  const j = op(id, 'APPLYING');
+  await store.create(j);
+  const out = await reconcileActive(store, hooks(), { environmentFingerprint: FP, isLiveOwner: async (j2) => j2.operationId === id });
+  assert.equal(out.decisions[0]!.kind, 'live');
+  assert.equal(out.safeModeRequired, false);
+  assert.ok((await store.loadActive(id)) !== null, 'live journal 不被 move/隔离');
+});
+
+test('startup：stale lock + incomplete → RECOVERY_REQUIRED / SAFE MODE，不自动 recover', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000c8';
+  const j = op(id, 'APPLYING');
+  j.steps = { s1: extStep('planned') };
+  await store.create(j);
+  const insp = await inspectStartup(store, { verifyStepFingerprint: async () => 'before-match', probeExternal: async () => 'half-installed', snapshotExists: async () => true }, env, {}, 'STALE_LOCK_DETECTED');
+  assert.equal(insp.recoveryRequired, true);
+  assert.equal(insp.safeModeRequired, true);
+  assert.equal(await store.readSafeMode(), true);
+  // 不能自动 recoverStaleLock：断言 active journal 仍原样（未被删除/隔离/规整）
+  assert.ok((await store.loadActive(id)) !== null);
+});
+
+test('executeRecovery：rollback 无用户确认 → needs-confirmation（零副作用）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000c9';
+  const j = op(id, 'APPLYING'); j.snapshotId = 'snap-1'; await store.create(j);
+  let rollbackRan = false;
+  const r = await executeRecovery(store, { operationId: id, action: 'rollback', snapshotId: 'snap-1', performRollback: async () => { rollbackRan = true; return { full: true, failed: [] }; } }, false);
+  assert.equal(r, 'needs-confirmation');
+  assert.equal(rollbackRan, false, '无确认不得执行破坏性回滚');
+});
+
+test('executeRecovery：有确认 → RECOVERING（终态由 verify 原子完成，不自行 ROLLED_BACK）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000ca';
+  const j = op(id, 'NEEDS_ATTENTION'); j.snapshotId = 'snap-1'; await store.create(j);
+  let rollbackRan = false;
+  const r = await executeRecovery(store, { operationId: id, action: 'rollback', snapshotId: 'snap-1', performRollback: async () => { rollbackRan = true; return { full: true, failed: [] }; } }, true);
+  assert.equal(r, 'done');
+  assert.equal(rollbackRan, true);
+  // §7.1：recovery 全程保持 RECOVERING（不引入 ROLLING_BACK）；终态迁移 + verification 写入
+  // 由 verify 路由以单次原子 journal update 完成。此处绝不自行转 ROLLED_BACK。
+  assert.equal((await store.load(id))?.state, 'RECOVERING');
+  assert.ok((await store.loadActive(id)) !== null, 'RECOVERING journal 仍 active（待 verify）');
+});
+
+// ---------- 幂等 ----------
+
+test('reconcile 幂等：重复运行稳定，不重复副作用', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000cb';
+  const j = op(id, 'APPLYING');
+  j.plannedSteps = ['s1']; j.steps = { s1: fileStep('done') };
+  await store.create(j);
+  await reconcileActive(store, hooks(), env);
+  await reconcileActive(store, hooks(), env);
+  await reconcileActive(store, hooks(), env);
+  // recovered 后已规整；再跑无 active
+  assert.deepEqual(await store.scanActive(), []);
+  assert.equal((await store.load(id))?.state, 'RECOVERED');
+});
+
+// ---------- F20：空 steps（opaque intent journal）不得判 RECOVERED ----------
+
+test('F20：APPLYING + 空 steps + 无 snapshot → NEEDS_ATTENTION（非 RECOVERED）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000cc';
+  const j = op(id, 'APPLYING'); // 默认 plannedSteps=[] steps={} snapshotId=null
+  await store.create(j);
+  const out = await reconcileActive(store, hooks(), env);
+  assert.equal(out.decisions[0]!.kind, 'needs-attention', '空 steps + APPLYING 不得判 recovered/noop');
+  assert.equal(out.safeModeRequired, true);
+  assert.equal((await store.load(id))?.state, 'NEEDS_ATTENTION');
+});
+
+test('F20：APPLYING + 空 steps + trusted snapshot → rollback-recommended', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000cd';
+  const j = op(id, 'APPLYING'); j.snapshotId = 'snap-1';
+  await store.create(j);
+  const out = await reconcileActive(store, hooks({ snapshotExists: async () => true }), env);
+  assert.equal(out.decisions[0]!.kind, 'rollback-recommended', '有 trusted snapshot 应推荐回滚');
+  assert.equal(out.safeModeRequired, true);
+});
+
+test('F20：CREATED + 空 steps → noop（mutation 未开始，安全）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000ce';
+  const j = op(id, 'CREATED'); // 默认空 steps
+  await store.create(j);
+  const out = await reconcileActive(store, hooks(), env);
+  assert.equal(out.decisions[0]!.kind, 'noop', 'CREATED + 空 steps 无 mutation，安全 noop');
+  assert.equal(out.safeModeRequired, false);
+  assert.equal((await store.load(id))?.state, 'RECOVERED');
+});
+
+// ---------- §6.5 recovery hard gate ----------
+
+test('§6.5：RECOVERING + 无 recoveryVerification → needs-attention（绝不自动 RECOVERED）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d1';
+  const j = op(id, 'RECOVERING'); j.snapshotId = 'snap-1';
+  await store.create(j);
+  const out = await reconcileActive(store, hooks({ snapshotExists: async () => true }), env);
+  assert.equal(out.decisions[0]!.kind, 'needs-attention', 'RECOVERING + 待验证绝不自动 RECOVERED');
+  assert.equal(out.safeModeRequired, true);
+  assert.equal((await store.load(id))?.state, 'NEEDS_ATTENTION');
+});
+
+test('§6.5：RECOVERING + MISMATCH verification → needs-attention（不 COMMITTED）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d2';
+  const j = op(id, 'RECOVERING'); j.snapshotId = 'snap-1';
+  j.recoveryVerification = { verdict: 'MISMATCH', details: ['host file 残留'], manualHints: [], at: '2026-01-01T00:00:00.000Z' };
+  await store.create(j);
+  const out = await reconcileActive(store, hooks({ snapshotExists: async () => true }), env);
+  assert.equal(out.decisions[0]!.kind, 'needs-attention', 'verdict 非 MATCH/PARTIAL_MATCH → needs-attention');
+  assert.equal(out.safeModeRequired, true);
+  assert.equal((await store.load(id))?.state, 'NEEDS_ATTENTION');
+});
+
+test('§6.5：RECOVERING + MATCH verification → 不触发门控（可 proceed）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d3';
+  const j = op(id, 'RECOVERING'); j.snapshotId = 'snap-1';
+  j.recoveryVerification = { verdict: 'MATCH', details: ['all match'], manualHints: [], at: '2026-01-01T00:00:00.000Z' };
+  j.plannedSteps = ['s1']; j.steps = { s1: fileStep('done') };
+  await store.create(j);
+  const out = await reconcileActive(store, hooks({ snapshotExists: async () => true }), env);
+  assert.notEqual(out.decisions[0]!.kind, 'needs-attention', 'MATCH verification 不触发硬门控');
+  assert.equal(out.decisions[0]!.kind, 'recovered', '已验证 RECOVERING 可 proceed 到 terminal');
+});
+
+test('§6.5：RECOVERING + PARTIAL_MATCH verification → 不触发门控（可 proceed）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d9';
+  const j = op(id, 'RECOVERING'); j.snapshotId = 'snap-1';
+  j.recoveryVerification = { verdict: 'PARTIAL_MATCH', details: ['核心匹配，凭据不可验证'], manualHints: ['凭据需人工确认'], at: '2026-01-01T00:00:00.000Z' };
+  j.plannedSteps = ['s1']; j.steps = { s1: fileStep('done') };
+  await store.create(j);
+  const out = await reconcileActive(store, hooks({ snapshotExists: async () => true }), env);
+  assert.notEqual(out.decisions[0]!.kind, 'needs-attention', 'PARTIAL_MATCH verification 不触发硬门控');
+  assert.equal(out.decisions[0]!.kind, 'recovered', 'PARTIAL_MATCH 已验证可 proceed 到 terminal');
+});
+
+test('§6.5：RECOVERING + VERIFICATION_ERROR verification → needs-attention（不 COMMITTED）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000da';
+  const j = op(id, 'RECOVERING'); j.snapshotId = 'snap-1';
+  j.recoveryVerification = { verdict: 'VERIFICATION_ERROR', details: ['快照重验失败'], manualHints: [], at: '2026-01-01T00:00:00.000Z' };
+  await store.create(j);
+  const out = await reconcileActive(store, hooks({ snapshotExists: async () => true }), env);
+  assert.equal(out.decisions[0]!.kind, 'needs-attention', 'VERIFICATION_ERROR → needs-attention（绝不自动 RECOVERED）');
+  assert.equal(out.safeModeRequired, true);
+  assert.equal((await store.load(id))?.state, 'NEEDS_ATTENTION');
+});
+
+test('§6.5：RECOVERING + entryDone 非空 → rollback-continue（门控之前，续跑中断回滚）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d4';
+  const j = op(id, 'RECOVERING'); j.snapshotId = 'snap-1';
+  j.rollback.entryDone = { 0: true };
+  await store.create(j);
+  const out = await reconcileActive(store, hooks({ snapshotExists: async () => true }), env);
+  assert.equal(out.decisions[0]!.kind, 'rollback-continue', 'entryDone 非空 → 续跑中断回滚（不违反 VERIFIED）');
+});
+
+// ---------- recomputeRecoveryDecision（§5.4） ----------
+
+test('recomputeRecoveryDecision：entryDone 非空 → rollback-continue', async (t) => {
+  const j = op('00000000-0000-4000-8000-0000000000d5', 'NEEDS_ATTENTION');
+  j.rollback.entryDone = { 0: true };
+  const d = await recomputeRecoveryDecision(j, { snapshotExists: async () => true });
+  assert.equal(d, 'rollback-continue');
+});
+
+test('recomputeRecoveryDecision：snapshotId 合法且存在 → rollback-recommended', async (t) => {
+  const j = op('00000000-0000-4000-8000-0000000000d6', 'NEEDS_ATTENTION');
+  j.snapshotId = 'snap-1';
+  const d = await recomputeRecoveryDecision(j, { snapshotExists: async () => true });
+  assert.equal(d, 'rollback-recommended');
+});
+
+test('recomputeRecoveryDecision：无 entryDone / 快照缺失 → needs-attention', async (t) => {
+  const j = op('00000000-0000-4000-8000-0000000000d7', 'NEEDS_ATTENTION');
+  j.snapshotId = 'snap-1';
+  const d = await recomputeRecoveryDecision(j, { snapshotExists: async () => false });
+  assert.equal(d, 'needs-attention');
+});
+
+test('recomputeRecoveryDecision：只读，不修改 journal / 不写 SAFE MODE', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d8';
+  const j = op(id, 'NEEDS_ATTENTION'); j.snapshotId = 'snap-1';
+  await store.create(j);
+  const before = await store.load(id);
+  await recomputeRecoveryDecision(before!, { snapshotExists: async () => true });
+  const after = await store.load(id);
+  assert.deepEqual(after, before, 'recomputeRecoveryDecision 不得修改 journal');
+  assert.equal(await store.readSafeMode(), false, '不得写 SAFE MODE');
+});
+
+// ---------- executeRecovery 引擎路由（§5.2） ----------
+
+test('executeRecovery：rollback-recommended → 调 restore executor（不调 rollback executor）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d9';
+  const j = op(id, 'NEEDS_ATTENTION'); j.snapshotId = 'snap-1'; await store.create(j);
+  let restoreRan = false; let rollbackRan = false;
+  const r = await executeRecovery(store, {
+    operationId: id, action: 'rollback', snapshotId: 'snap-1', decision: 'rollback-recommended',
+    performRestore: async () => { restoreRan = true; return { full: true, failed: [] }; },
+    performRollback: async () => { rollbackRan = true; return { full: true, failed: [] }; },
+  }, true);
+  assert.equal(r, 'done');
+  assert.equal(restoreRan, true, 'rollback-recommended 应调 restore executor');
+  assert.equal(rollbackRan, false, '不得混用 rollback executor');
+  assert.equal((await store.load(id))?.state, 'RECOVERING', 'NEEDS_ATTENTION → RECOVERING');
+});
+
+test('executeRecovery：rollback-continue（缺省）→ 调 rollback executor', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000da';
+  const j = op(id, 'NEEDS_ATTENTION'); j.snapshotId = 'snap-1'; await store.create(j);
+  let rollbackRan = false;
+  const r = await executeRecovery(store, {
+    operationId: id, action: 'rollback', snapshotId: 'snap-1',
+    performRollback: async () => { rollbackRan = true; return { full: true, failed: [] }; },
+  }, true);
+  assert.equal(r, 'done');
+  assert.equal(rollbackRan, true, '缺省 decision 走 rollback executor');
+  assert.equal((await store.load(id))?.state, 'RECOVERING');
+});
+
+test('executeRecovery：rollback 无 executor → failed（不执行）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000db';
+  const j = op(id, 'NEEDS_ATTENTION'); j.snapshotId = 'snap-1'; await store.create(j);
+  const r = await executeRecovery(store, { operationId: id, action: 'rollback', snapshotId: 'snap-1' }, true);
+  assert.equal(r, 'failed');
+  assert.equal((await store.load(id))?.state, 'NEEDS_ATTENTION', '无 executor 不得迁移状态');
+});
+// ---------- t37：durable SAFE MODE 标记的**三态**消费（unknown 必须与 clear 区分，并按各消费点 fail-closed） ----------
+
+test('t37：标记存在但不可判定（安全模式路径被目录占位）→ durableSafeState=unknown 且 safeModeRequired=true', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  await store.ensureDirs();
+  // 标记路径上是目录（非普通文件）→ classifySafeModeMarker: kind='not-file' → 'unknown'
+  await fs.mkdir(safeModeMarkerPath(dir), { recursive: true });
+  const insp = await inspectStartup(store, hooks(), env, {}, 'FREE');
+  assert.equal(insp.durableSafeState, 'unknown', 'unknown 必须与 clear 区分开（旧实现把它压成 boolean false）');
+  assert.equal(insp.safeModeRequired, true, '无法判定 → fail-closed，绝不读成「没有标记」');
+});
+
+test('t37：标记存在但读不出（无读权限）→ unknown 且 fail-closed', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  await store.ensureDirs();
+  // 先写一个合法标记，再把它读回一遍确认 blocked，然后替换成不可读形态（目录）——覆盖 'unreadable'/非普通文件两条 unknown 路径
+  await fs.writeFile(safeModeMarkerPath(dir), 'blocked', 'utf8');
+  assert.equal(await store.readSafeModeState(), 'blocked');
+  await fs.rm(safeModeMarkerPath(dir), { recursive: true, force: true });
+  await fs.mkdir(safeModeMarkerPath(dir), { recursive: true });
+  const insp = await inspectStartup(store, hooks(), env, {}, 'FREE');
+  assert.equal(insp.durableSafeState, 'unknown');
+  assert.equal(insp.safeModeRequired, true);
+});
+
+test('t37 对照：确实没有标记 → durableSafeState=clear 且不因标记阻断（unknown ≠ clear）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  await store.ensureDirs();
+  const insp = await inspectStartup(store, hooks(), env, {}, 'FREE');
+  assert.equal(insp.durableSafeState, 'clear', '标记确实不存在 + 布局可信 → clear');
+  assert.equal(insp.safeModeRequired, false, 'clear 不得被误升为阻断');
+});
+
+test('t37：标记为 blocked → durableSafeState=blocked 且 safeModeRequired=true（既有阻断语义不变）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  await store.writeSafeMode(true);
+  const insp = await inspectStartup(store, hooks(), env, {}, 'FREE');
+  assert.equal(insp.durableSafeState, 'blocked');
+  assert.equal(insp.safeModeRequired, true);
+});
+
+test('t37：Phase3Recovery.refreshSafeMode 消费三态（unknown → isBlocked 阻断）；clearSafeMode 清理通道不变', async (t) => {
+  const dir = tmp(t);
+  const recovery = new Phase3Recovery({ dataDir: dir, packageVersion: '0.1.54', environmentFingerprint: 'fp-t37' });
+  await fs.mkdir(safeModeMarkerPath(dir), { recursive: true });
+  await recovery.refreshSafeMode();
+  assert.equal(recovery.lastSafeModeState, 'unknown', 'unknown 不与 clear 混淆');
+  assert.equal(recovery.isBlocked(), true, '无法判定 → mutation 闸门 fail-closed（旧实现 readSafeMode().catch(()=>false) → false）');
+  // 清理通道：用户显式 recovery → clearSafeMode（写标记 false + 内存复位）
+  await fs.rm(safeModeMarkerPath(dir), { recursive: true, force: true });
+  await recovery.clearSafeMode();
+  assert.equal(recovery.lastSafeModeState, 'clear');
+  assert.equal(recovery.isBlocked(), false, '清理通道行为不变');
+  await recovery.refreshSafeMode();
+  assert.equal(recovery.lastSafeModeState, 'clear', '标记已清除 → 刷新后仍为 clear');
+});
+
+// ---------- issue #87：可自证的崩溃残留自动放行 ----------
+
+function backupOp(id: string, state: OperationJournal['state'] = 'APPLYING'): OperationJournal {
+  const j = createJournalEntry('backup-schedule', { operationId: id, ownerInstanceId: 'o1', lockId: 'l1', packageVersion: '0.1.71', environmentFingerprint: FP }, '2026-01-01T00:00:00.000Z');
+  j.state = state;
+  return j;
+}
+function backupExtStep(status: JournalStep['status'] = 'planned'): JournalStep {
+  return { adapter: 'backup', ref: 'exports', kind: 'Backup', external: true, beforeFp: null, afterFp: null, status, appliedAt: null };
+}
+const unknownProbe: Partial<ReconcileProbeHooks> = { probeExternal: async () => 'unknown' };
+
+test('issue #87：定时备份残留（planned external backup step + 无快照）→ noop 自动放行，不再永久占 SAFE MODE', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d1';
+  const j = backupOp(id);
+  j.plannedSteps = ['ext'];
+  j.steps = { ext: backupExtStep() };
+  await store.create(j);
+  // 生产形态：external step 无指纹 ⇒ probe 恒 unknown（修复前正是这一条把它顶成 needs-attention）
+  const out = await reconcileActive(store, { ...hooks(), ...unknownProbe }, env);
+  assert.equal(out.decisions[0]!.kind, 'noop');
+  assert.equal(out.safeModeRequired, false);
+  assert.equal(await store.readSafeMode(), false, '不得写 durable SAFE MODE');
+  assert.equal((await store.load(id))?.state, 'RECOVERED');
+  assert.deepEqual(await store.scanActive(), [], '必须规整出 active');
+});
+
+test('issue #87：定时备份残留（一个 step 都没登记）→ noop（该通道先落 step 再调 fn，无 step ⇒ fn 未开始）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d2';
+  await store.create(backupOp(id));
+  const out = await reconcileActive(store, { ...hooks(), ...unknownProbe }, env);
+  assert.equal(out.decisions[0]!.kind, 'noop');
+  assert.equal(out.safeModeRequired, false);
+});
+
+test('issue #87 对照：同样 external 形状但 operationType 会改用户配置（import-apply）→ 仍 NEEDS_ATTENTION', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d3';
+  const j = op(id, 'APPLYING');
+  j.plannedSteps = ['ext'];
+  j.steps = { ext: backupExtStep() };
+  await store.create(j);
+  const out = await reconcileActive(store, { ...hooks(), ...unknownProbe }, env);
+  assert.equal(out.decisions[0]!.kind, 'needs-attention', '只放行 artifact-only 通道，绝不按形状普放');
+  assert.equal(out.safeModeRequired, true);
+});
+
+test('issue #87 对照：定时备份但 step 已 applied/非 planned → 保持保守', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d4';
+  const j = backupOp(id);
+  j.plannedSteps = ['ext'];
+  j.steps = { ext: { ...backupExtStep('done'), appliedAt: '2026-01-01T00:00:01.000Z' } };
+  await store.create(j);
+  const out = await reconcileActive(store, { ...hooks(), ...unknownProbe }, env);
+  assert.equal(out.decisions[0]!.kind, 'needs-attention');
+  assert.equal(out.safeModeRequired, true);
+});
+
+test('issue #87 对照：定时备份但 step 不是 backup 适配器（可能装插件）→ 保持保守', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d5';
+  const j = backupOp(id);
+  j.plannedSteps = ['p1'];
+  j.steps = { p1: extStep('planned') };
+  await store.create(j);
+  const out = await reconcileActive(store, { ...hooks(), ...unknownProbe }, env);
+  assert.equal(out.decisions[0]!.kind, 'needs-attention');
+  assert.equal(out.safeModeRequired, true);
+});
+
+test('issue #87 对照：定时备份但已有 snapshotId（可回滚）→ 走原 rollback 路径，不判 noop', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d6';
+  const j = backupOp(id);
+  j.snapshotId = '00000000-0000-4000-8000-0000000000aa';
+  j.plannedSteps = ['ext'];
+  j.steps = { ext: backupExtStep() };
+  await store.create(j);
+  const out = await reconcileActive(store, { ...hooks(), ...unknownProbe }, env);
+  assert.equal(out.decisions[0]!.kind, 'needs-attention');
+  assert.equal(out.safeModeRequired, true);
+});
+
+test('issue #87 对照：ownership binding 不匹配 → 早于自证门的信任门先拦（不越权接管）', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d7';
+  const j = backupOp(id);
+  j.plannedSteps = ['ext'];
+  j.steps = { ext: backupExtStep() };
+  await store.create(j);
+  const out = await reconcileActive(store, { ...hooks(), ...unknownProbe }, { ...env, expectedOwnershipInstanceId: 'someone-else' });
+  assert.equal(out.decisions[0]!.kind, 'needs-attention');
+  assert.match(out.decisions[0]!.reason, /binding|ownerInstanceId/i);
+});
+
+test('issue #87 对照：零步骤的 sync-push（非 artifact-only 通道）→ 保持 opaque NEEDS_ATTENTION', async (t) => {
+  const dir = tmp(t);
+  const store = mkStore(dir);
+  const id = '00000000-0000-4000-8000-0000000000d8';
+  const j = createJournalEntry('sync-push', { operationId: id, ownerInstanceId: 'o1', lockId: 'l1', packageVersion: '0.1.71', environmentFingerprint: FP }, '2026-01-01T00:00:00.000Z');
+  j.state = 'APPLYING';
+  await store.create(j);
+  const out = await reconcileActive(store, { ...hooks(), ...unknownProbe }, env);
+  assert.equal(out.decisions[0]!.kind, 'needs-attention');
+  assert.equal(out.safeModeRequired, true);
+});
+

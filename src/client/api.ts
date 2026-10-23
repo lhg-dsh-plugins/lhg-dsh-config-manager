@@ -1,0 +1,961 @@
+/**
+ * Config Manager 浏览器半 —— `/api/dsh-config-manager/*` 的类型化 fetch 封装。
+ *
+ * 设计对齐 dsh-ssh 的 `src/client/api.ts` 范式（同源 fetch、readJson、query helper），
+ * 但方法签名直接实现 `src/ui/types.ts` 的 `ExportPort` / `ImportPort` 端口契约：
+ * 客户端控制器（ExportFlow / ImportWizard）把本类实例当作 port 注入即可，
+ * 无需任何额外适配层 —— 这是「直接绑定 src/ui，不重复实现」的关键。
+ *
+ * 端点契约（Host 半 `src/index.ts` 按此实现，见 CLIENT_DEPENDENCIES.md 的接口说明）：
+ * ```
+ * GET  /api/dsh-config-manager/status             → ServiceStatus        （健康/版本检查）
+ * POST /api/dsh-config-manager/export             → ExportResponse       （body: ExportOptions；响应含 runId）
+ * GET  /api/dsh-config-manager/download?path=…    → 文件流（content-disposition 文件名）
+ * POST /api/dsh-config-manager/upload?name=…      → UploadResponse       （body: 原始字节）
+ * POST /api/dsh-config-manager/analyze            → ImportAnalysis       （body: { zipPath }）
+ * POST /api/dsh-config-manager/plan               → ImportPlan           （body: { zipPath, decisions }）
+ * POST /api/dsh-config-manager/execute            → ImportResult         （body: { zipPath, plan, opts }；响应含 runId）
+ * GET  /api/dsh-config-manager/progress?runId=…   → RunState             （run 实时状态：轮询/刷新恢复）
+ * GET  /api/dsh-config-manager/runs               → RunState[]           （活跃 run 列表）
+ * GET  /api/dsh-config-manager/backup-files       → { files: BackupFileMeta[] }（exports 备份文件列表）
+ * POST /api/dsh-config-manager/backup-files/delete → { removed }          （body: { name }）
+ * ```
+ * 安全约束：
+ *  - 所有响应/错误文本在进入 UI 前经 `redact()`（见 common/ErrorBanner.tsx）；
+ *  - secretInputs 只存在于请求体内，绝不落日志；
+ *  - 本文件不 import 任何 node 模块（纯浏览器 bundle）。
+ */
+
+import type { ImportAnalysis, ImportDecisions, ImportPlan, ImportResult } from '../core/types.ts';
+import type { ExportOptions, ExportReport, ExportUnit } from '../core/types.ts';
+import type { RestorePlan, RestoreReport, SnapshotMeta } from '../core/restore.ts';
+import type { RestoreChangeSummary, SnapshotFileDiff } from '../core/snapshot-diff.ts';
+import type { DshProfileCopyResult, DshProfileDetail, DshProfileLaunchResult, DshProfileMeta, DshProfileRunningView, DshProfilesSnapshot, DshProfileStopOutcome } from '../profiles/dsh-profile-shared.ts';
+
+import type { RunState } from '../core/run-registry.ts';
+import type { ConsultReport } from '../core/migration-consult.ts';
+import type { Manifest, SectionId } from '../schema/types.ts';
+import type { BackupScheduleStatus, BackupRunResult, BackupScheduleDraft } from '../ui/backup-schedule.ts';
+import type { BackupFileMeta } from '../sync/backup-files.ts';
+import type { DiskUsageCleanupResult, PluginUpdateApplyResult, PluginUpdateCheckResult } from '../ui/types.ts';
+import type { SessionExportProbe } from './session-export/session-export-view.ts';
+import type { ForeignSkip } from '../foreign/types.ts';
+import type { ForeignSourcesResponse as ForeignSourcesViewInput } from '../ui/foreign-view.ts';
+import type { DiskUsageReport } from '../core/disk-usage.ts';
+import type { UiT } from '../ui/i18n.ts';
+import { failedSectionsFromResponse } from '../ui/export-flow.ts';
+import type { SessionFormatDisposition } from '../ui/session-format-disposition.ts';
+import { CONFIG_MANAGER_API } from './common/routes.ts';
+import {
+  ConfigManagerApiError,
+  getJson,
+  LONG_REQUEST_TIMEOUT_MS,
+  openStream,
+  postJson,
+  requestJson,
+  type RequestOptions,
+  type StreamHandle,
+} from './common/http.ts';
+
+/** Host 半健康检查响应（plugin 版本 / DSH 版本 / 平台，用于主页横幅与兼容性说明） */
+export interface ServiceStatus {
+  ready: boolean;
+  pluginVersion: string;
+  dshVersion: string;
+  platform: string;
+  arch: string;
+  /**
+   * issue #28 诊断位（best-effort，失败时缺省）：插件清单实际读的是哪个目录 / 哪个 profile /
+   * 看到几个插件。用于定位「装了插件但备份没识别到」——用户可据此自查 profile 与 DSH_HOME。
+   */
+  homeDir?: string;
+  profile?: string;
+  /** profile 的 package.json 是否可读（false → 清单必然为空） */
+  profileManifestReadable?: boolean;
+  installedPluginCount?: number;
+  installedPluginNames?: string[];
+  /** dsh.profile.bundles 声明（非空即替换默认插件栈） */
+  bundles?: string[];
+}
+
+/**
+ * 外部 agent 来源发现响应（`GET /foreign-sources`）。
+ *
+ * 复用 `src/ui/foreign-view.ts` 的输入类型 —— 响应形状的**唯一权威**在那边（视图模型只读它）。
+ * 路径刻意在本文件重导出，避免组件同时 import 两处（同 `UploadResponse` 的做法）。
+ */
+export type ForeignSourcesResponse = ForeignSourcesViewInput
+
+/**
+ * 外部来源 → bundle 的响应（`POST /foreign-import`）。
+ *
+ * `zipPath`：受控临时目录里的标准 bundle v1 ZIP，直接喂给既有导入向导的 `analyzeImport`。
+ * `skipped` / `credentialRefs` **绝不含凭据值**（值在转换层已被剥离）。
+ */
+export interface ForeignImportResponse {
+  zipPath: string
+  name: string
+  /** 来源 id（六来源之一） */
+  source: string
+  /** 来源显示名的字典键（如 foreign.source.hermes） */
+  labelKey: string
+  /** 产物字节数（读不到时为 0，界面按「未知」处理） */
+  sizeBytes: number
+  /** 本次产出包内的分区（空分区不会被写入，也不出现在这里） */
+  sections: SectionId[]
+  /** 各分区的条目计数（机器可读；键形如 `mcp.servers`） */
+  counts: Record<string, number>
+  /** 未迁移项（只有机器码 + 位置名 + 条数） */
+  skipped: ForeignSkip[]
+  /** 凭据**引用名**（形如 `mcp:gitnexus:GITHUB_TOKEN`）；导入后由用户补录值 */
+  credentialRefs: string[]
+  /** 检测到的本机位置（相对 home；绝不回传绝对路径） */
+  detectedPaths: string[]
+  /** 冲突策略（用户决策：同 id 不覆盖、跳过并报码） */
+  conflictPolicy: string
+}
+/** export 端点响应（对齐 ExportFlow 的 ExportRunResult 前半部分；runId 为 m1 run 注册表标识） */
+export interface ExportResponse {
+  zipPath: string;
+  manifest: Manifest;
+  report: ExportReport;
+  /** m1：本次导出 run 的 id（可用 /progress 查询状态 / 刷新恢复） */
+  runId: string;
+}
+
+/** upload 端点响应：Host 把用户上传的 ZIP 存入受控临时目录，返回可被 analyze/plan/execute 引用的路径 */
+export interface UploadResponse {
+  zipPath: string;
+  name: string;
+  sizeBytes: number;
+  /** zip=普通备份；encrypted=整体加密备份容器（需先 decryptArchive 解锁才能按 ZIP 解析） */
+  containerType: 'zip' | 'encrypted';
+}
+
+/** P1-⑦/P2-⑬：备份内容查看 / 差异对比结果（只读；复用 analyze + plan 链路，零写入） */
+export interface BackupInspectResult {
+  analysis: ImportAnalysis;
+  plan: ImportPlan;
+}
+
+/** P2-⑫：导出前预览响应（不落盘 ZIP；各分区 counts + 估算大小） */
+export interface ExportPreviewResponse {
+  ok: boolean;
+  /**
+   * Phase 1：每个分区附带**可单独勾选的最小单元**清单（`items`）。
+   * items 为空数组 = 本分区不可细分（UI 只给整体开关）。单元由 adapter.listUnits()
+   * 零 I/O 派生，id 命名空间与导入侧 PlanItem.id 一致。
+   */
+  sections: { section: SectionId; count: number; sizeBytes: number; items: ExportUnit[] }[];
+  totalSections: number;
+  totalSizeBytes: number;
+  /** 读取失败的分区**数量**（既有契约，语义与类型均不变） */
+  sectionsFailed: number;
+  /**
+   * 读取失败的分区 **id 列表**（t7，可选）。
+   *
+   * 宿主逐个分区调用 adapter.export 失败时一并收集。有了它，客户端不必再靠
+   * 「请求了但没回来」推断失败分区，可以直接精确标注。
+   *
+   * 向后兼容：**可选**字段 —— 旧宿主（或第三方实现）不回该字段时，客户端回退到
+   * 推断路径（见 `ui/export-flow.ts` 的 `failedSectionsFromResponse`）；
+   * 旧客户端看到未知字段也会忽略，不受影响。
+   */
+  failedSections?: SectionId[];
+}
+
+/**
+ * 从 /export-preview 响应算出「哪些分区的清单读取失败」（t7）。
+ *
+ * 两条来源合并：
+ *  1. **宿主精确清单** `response.failedSections`（新增可选字段）：路由逐个分区 export 失败时
+ *     点名的 id，最权威；
+ *  2. **推断**（`requested` − `response.sections`，见 src/ui/export-flow.ts 的
+ *     `failedSectionsFromResponse`）：旧宿主不回该字段时的兜底 —— 路由对每个请求过的分区
+ *     要么回一条清单、要么计入失败，因此「没回来 = 失败」，与改造前行为完全一致。
+ * 两者取并集（宿主正确时二者等价，故不会多报），保持 `requested` 顺序；
+ * `requested` 之外的 id 一律忽略（不越批标记）。
+ *
+ * 放在 API 层而非组件里：这是「解析响应」的纯逻辑，可 node 单测；React 壳只调用
+ * （AGENTS.md：禁止在 React 组件里写可测试业务逻辑）。
+ */
+export function resolveFailedSections(
+  requested: readonly SectionId[],
+  response: Pick<ExportPreviewResponse, 'sections' | 'failedSections'>,
+): SectionId[] {
+  const derived = failedSectionsFromResponse(requested, response.sections.map((s) => s.section));
+  const precise = response.failedSections;
+  if (precise === undefined) return derived;
+  const named = new Set(precise);
+  return requested.filter((s) => derived.includes(s) || named.has(s));
+}
+
+/** execute 端点请求体（对齐 ImportWizard.execute 的 opts） */
+export interface ExecutePayload {
+  zipPath: string;
+  plan: ImportPlan;
+  opts: {
+    /** 安全阀：非 true 拒绝执行（core ImportNotConfirmedError） */
+    confirm: boolean;
+    /** 秘密补录值（仅内存，经 HTTPS 传输，Host 端不落盘） */
+    secretInputs: Record<string, string>;
+    /** true=任一项失败整体回滚（场景 E）；false=单项失败继续 */
+    rollbackOnError: boolean;
+    /** 加密备份的解密密码（仅内存；加密备份必须提供，core 拒绝无密码导入） */
+    decryptPassword?: string;
+    /** 会话格式处置（T1；abort 时若计划含本机读不了的会话则拒绝执行，零写入） */
+    sessionFormatDisposition?: SessionFormatDisposition;
+  };
+}
+
+/** decrypt-archive 端点响应：解锁整体加密容器后返回明文 ZIP 路径 + 解密覆盖的凭据 ref 名（非值） */
+export interface DecryptArchiveResponse {
+  zipPath: string;
+  /** 解密覆盖的凭据 ref 名（非值）；UI 据此从补录阶段剔除已恢复项 */
+  refs: string[];
+}
+
+/** restore 端点响应：dryRun=true 返回 plan；执行返回 report（与 CLI 一致的诚实报告）。
+ *  runId 仅真实执行时存在（宿主 RunRegistry 登记；/runs + /progress 刷新恢复用）。 */
+export interface RestoreResponse {
+  dryRun: boolean;
+  plan?: RestorePlan;
+  report?: RestoreReport;
+  runId?: string;
+  /** git 风格预览：逐动作的变更状态 + 行数统计（dryRun=true 时由宿主附带；旧宿主不返回） */
+  changeSummary?: RestoreChangeSummary;
+  /** 恢复计划指纹（dryRun=true 时由宿主附带；执行时回传以发现「确认后磁盘又变了」；旧宿主不返回） */
+  planFingerprint?: string;
+}
+
+/** Star 引导弹窗状态（GET /star-prompt；纯偏好，无 secret） */
+export interface StarPromptStatus {
+  ok: boolean;
+  /** 引导用户点 Star 的 GitHub 仓库地址（Host 提供，硬编码常量） */
+  repoUrl: string;
+  /** 首次进入页面时间（ms 时间戳）；undefined = 尚未进入过页面 */
+  firstSeenAt?: number;
+  /** 用户点过「不再提示」 */
+  dismissed: boolean;
+  /** 用户点过「去点 Star」（方案 A：引导完成） */
+  clicked: boolean;
+}
+
+/** Star 引导弹窗状态的局部更新补丁（POST /star-prompt；全部可选） */
+export interface StarPromptPatch {
+  firstSeenAt?: number;
+  dismissed?: boolean;
+  clicked?: boolean;
+}
+
+/** POST /star-prompt 响应（更新后的最新状态） */
+export interface StarPromptSaveResponse {
+  ok: boolean;
+  firstSeenAt?: number;
+  dismissed: boolean;
+  clicked: boolean;
+}
+
+/** 更新内容弹窗状态（GET /release-notes-prompt） */
+export interface ReleaseNotesPromptStatus {
+  ok: boolean;
+  lastSeenVersion?: string;
+  dismissed: boolean;
+  currentVersion?: string;
+}
+
+/** 更新内容弹窗状态局部更新补丁（POST /release-notes-prompt） */
+export interface ReleaseNotesPromptPatch {
+  lastSeenVersion?: string;
+  dismissed?: boolean;
+}
+
+/** POST /release-notes-prompt 响应 */
+export interface ReleaseNotesPromptSaveResponse {
+  ok: boolean;
+  lastSeenVersion?: string;
+  dismissed: boolean;
+}
+
+/**
+ * 路由族常量与请求封装的**唯一来源**都在 `common/` 下（W4 收敛）：
+ *  - 路由常量 → `common/routes.ts`；
+ *  - `readJson` / `getJson` / `postJson`（超时 + 取消）与 `ConfigManagerApiError` → `common/http.ts`。
+ * 此处重导出，保持既有导入面不变（`import { CONFIG_MANAGER_API } from '../client/api.ts'` 等）。
+ */
+export { CONFIG_MANAGER_API };
+export { ConfigManagerApiError } from './common/http.ts';
+
+/** 长操作请求选项（5 分钟；超时文案走默认键 `error.requestTimeout`，导出族另有专属键）。 */
+const LONG_OPTS: RequestOptions = { timeoutMs: LONG_REQUEST_TIMEOUT_MS };
+
+/** 插件自更新请求的超时：宿主侧安装上限 15 分钟，客户端留出余量（16 分钟）避免误报「请求超时」。 */
+const SELF_UPDATE_OPTS: RequestOptions = { timeoutMs: 16 * 60 * 1000 };
+
+/** query-string 辅助（跳过 undefined/空串，与 dsh-ssh 一致） */
+function query(params: Record<string, string | number | undefined>): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== '') search.set(key, String(value));
+  }
+  const text = search.toString();
+  return text === '' ? '' : '?' + text;
+}
+
+/** 浏览器 File System Access API 的最小表面（非全部 lib.dom 版本都有） */
+interface WindowWithFileSystemAccess {
+  showSaveFilePicker?: (options: { suggestedName?: string }) => Promise<{
+    createWritable: () => Promise<{ write: (data: Uint8Array) => Promise<void>; close: () => Promise<void> }>;
+  }>;
+}
+
+/** 导出下载结果（流式落盘或内存 Blob 兜底） */
+export interface DownloadResult {
+  blob?: Blob;
+  filename: string;
+  streamed: boolean;
+  bytes: number;
+}
+
+/** 下载选项：saveDialog=true 才弹系统保存对话框（需用户手势）；缺省自动下载到浏览器下载目录 */
+export interface DownloadOptions {
+  saveDialog?: boolean;
+}
+
+/** 用 Blob URL + <a download> 触发浏览器静默下载到默认下载目录（无需用户手势/另存为对话框）。 */
+function triggerBlobDownload(blob: Blob, filename: string): void {
+  if (typeof document === 'undefined' || typeof URL === 'undefined') return
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  anchor.style.display = 'none'
+  document.body.appendChild(anchor)
+  anchor.click()
+  document.body.removeChild(anchor)
+  // 稍后释放 URL：立即 revoke 可能让部分浏览器来不及开始下载
+  setTimeout(() => { URL.revokeObjectURL(url) }, 15_000)
+}
+
+/**
+ * Config Manager 浏览器半的唯一数据入口。
+ * 同时实现 `ExportPort`（export-flow 用）与 `ImportPort`（import-wizard 用）。
+ */
+export class ConfigManagerApi {
+  /**
+   * 加密备份密码（仅内存，默认 null = 普通备份）。
+   * ExportView 在 run 前设置；export 请求体携带给 Host 半做 AES-256-GCM 加密。
+   * 绝不写入 manifest / 任何 DSH 配置 / localStorage。
+   */
+  exportPassword: string | null = null
+  /** 客户端展示层翻译器（zh 源 / en 镜像，见 ui/i18n.ts）。 */
+  readonly t: UiT
+
+  constructor(t: UiT) {
+    this.t = t
+  }
+
+  // ------------------------------------------------------------- status
+  /** 健康/版本检查（主页横幅：插件版本 / DSH 版本 / 平台） */
+  async status(): Promise<ServiceStatus> {
+    return getJson<ServiceStatus>(CONFIG_MANAGER_API.status, this.t);
+  }
+
+  // ------------------------------------------------------------- star-prompt
+  /** Star 引导弹窗状态（进入页面时判定是否展示 / 是否补记首次使用时间）。 */
+  async starPromptStatus(): Promise<StarPromptStatus> {
+    return getJson<StarPromptStatus>(CONFIG_MANAGER_API.starPrompt, this.t);
+  }
+
+  // ------------------------------------------------------- export-preview
+  /** P2-⑫：导出前只读预览（不落盘 ZIP）——「将打包 X 分区 / Y 条目 / 约 Z 大小」。 */
+  /**
+   * 只读清单（不落盘 ZIP）：分区 + 可勾选单元 + 估算大小。
+   * `only` 缺省 = 推荐分区；内容选择器按「已勾选分区」与「展开/勾选某分区」分批调用，
+   * 避免为了打开选择器就把 sessions 全量读一遍。
+   */
+  async exportPreview(only?: SectionId[]): Promise<ExportPreviewResponse> {
+    // 预览要逐分区问 adapter（大 home 上可能不慢但也不是纯 K/V 读）：长操作档位。
+    return postJson<ExportPreviewResponse>(CONFIG_MANAGER_API.exportPreview, { only }, this.t, LONG_OPTS);
+  }
+
+  /** 保存 Star 引导弹窗状态（局部更新：firstSeenAt / dismissed / clicked）。
+   * 纯偏好无 secret；失败由调用方静默降级（本次不弹/不记，下次再判）。 */
+  async saveStarPrompt(patch: StarPromptPatch): Promise<StarPromptSaveResponse> {
+    const body: StarPromptPatch = {};
+    if (patch.firstSeenAt !== undefined) body.firstSeenAt = patch.firstSeenAt;
+    if (patch.dismissed === true) body.dismissed = true;
+    if (patch.clicked === true) body.clicked = true;
+    return postJson<StarPromptSaveResponse>(CONFIG_MANAGER_API.starPrompt, body, this.t);
+  }
+
+  // ------------------------------------------------------------- release-notes-prompt
+  /** 更新内容弹窗状态（进入页面时判定是否展示 / 是否已永不提示）。 */
+  async releaseNotesPromptStatus(): Promise<ReleaseNotesPromptStatus> {
+    return getJson<ReleaseNotesPromptStatus>(CONFIG_MANAGER_API.releaseNotesPrompt, this.t);
+  }
+
+  /** 保存更新内容弹窗状态（局部更新：lastSeenVersion / dismissed）。 */
+  async saveReleaseNotesPrompt(patch: ReleaseNotesPromptPatch): Promise<ReleaseNotesPromptSaveResponse> {
+    const body: ReleaseNotesPromptPatch = {};
+    if (patch.lastSeenVersion !== undefined) body.lastSeenVersion = patch.lastSeenVersion;
+    if (patch.dismissed === true) body.dismissed = true;
+    return postJson<ReleaseNotesPromptSaveResponse>(CONFIG_MANAGER_API.releaseNotesPrompt, body, this.t);
+  }
+
+  // ------------------------------------------------------------- export
+  /** ExportPort.export：调用 Host 侧导出编排（core Exporter）。加密密码随请求体传输（仅内存）。
+   * 带 5 分钟超时（AbortController 在 common/http.ts）：宿主若卡死，客户端得到明确错误而不是永远停在进度条。 */
+  async export(options: ExportOptions): Promise<ExportResponse> {
+    const body: ExportOptions & { password?: string } = {
+      ...options,
+      password: this.exportPassword ?? undefined,
+    };
+    // 长操作（5 分钟）：超时文案沿用 error.exportTimeout（分钟插值），与改造前一致。
+    return postJson<ExportResponse>(CONFIG_MANAGER_API.export, body, this.t, {
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+      timeoutKey: 'error.exportTimeout',
+    });
+  }
+
+  /**
+   * 把导出的 ZIP 下载到本机。
+   * - 默认（saveDialog 缺省/false）：读取为 Blob 后用 <a download> 触发浏览器
+   *   静默下载到「下载」目录，无需用户额外操作（导出完成即可自动调用）；
+   * - saveDialog: true：优先 File System Access API 流式落盘（不占整文件内存），
+   *   用户可在系统保存对话框中选择位置；不可用/取消时回退 Blob 下载。
+   *
+   * 请求本身走 `common/http.ts` 的 `openStream`（唯一封装）：headers 阶段有超时，
+   * 正文阶段是**空闲超时**（每读一块数据重置）——宿主卡死时下载明确失败而非永久转圈。
+   */
+  async download(
+    zipPath: string,
+    opts?: DownloadOptions,
+    onProgress?: (received: number, total: number) => void,
+  ): Promise<DownloadResult> {
+    const stream = await openStream(CONFIG_MANAGER_API.download + query({ path: zipPath }), this.t);
+    try {
+      return await this.saveDownloaded(stream, zipPath, opts, onProgress);
+    } catch (err) {
+      throw stream.mapTimeout(err);
+    } finally {
+      stream.close();
+    }
+  }
+
+  /** 读取流式下载响应并落盘（流式写优先；不可用时 Blob + <a download> 兜底）。 */
+  private async saveDownloaded(
+    stream: StreamHandle,
+    zipPath: string,
+    opts?: DownloadOptions,
+    onProgress?: (received: number, total: number) => void,
+  ): Promise<DownloadResult> {
+    const response = stream.response;
+    if (!response.ok || response.body === null) {
+      const text = await response.text().catch(() => '');
+      throw new ConfigManagerApiError(text !== '' ? text : this.t('error.downloadFailed', { status: String(response.status) }));
+    }
+    const total = Number(response.headers.get('content-length') ?? '0');
+    const disposition = response.headers.get('content-disposition') ?? '';
+    const match = /filename="([^"]+)"/.exec(disposition);
+    const filename = match?.[1] ?? zipPath.split(/[\\/]/).pop() ?? 'dsh-config.zip';
+    const reader = response.body.getReader();
+    const usePicker =
+      opts?.saveDialog === true
+      && typeof window !== 'undefined'
+      && (window as WindowWithFileSystemAccess).showSaveFilePicker !== undefined;
+    let writable: { write: (data: Uint8Array) => Promise<void>; close: () => Promise<void> } | undefined;
+    const chunks: Uint8Array<ArrayBuffer>[] = [];
+    let received = 0;
+    if (usePicker) {
+      // 用户在系统保存对话框里的停留不计入空闲超时（交互不是「宿主无响应」）。
+      stream.pause();
+      try {
+        const picker = (window as WindowWithFileSystemAccess).showSaveFilePicker!;
+        const handle = await picker.call(window, { suggestedName: filename });
+        writable = await handle.createWritable();
+      } catch {
+        // 用户取消保存对话框或 API 不可用：回退内存 Blob + <a download>。
+        writable = undefined;
+      } finally {
+        stream.resume();
+      }
+    }
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (writable !== undefined) {
+        await writable.write(value as Uint8Array);
+      } else {
+        chunks.push(value as Uint8Array<ArrayBuffer>);
+      }
+      received += value.length;
+      stream.keepAlive();
+      onProgress?.(received, total);
+    }
+    if (writable !== undefined) {
+      await writable.close();
+      return {
+        blob: undefined,
+        filename,
+        streamed: true,
+        bytes: received,
+      };
+    }
+    // 默认路径：<a download> 静默下载到浏览器「下载」目录
+    const blob = new Blob(chunks);
+    triggerBlobDownload(blob, filename);
+    return {
+      blob,
+      filename,
+      streamed: false,
+      bytes: received,
+    };
+  }
+
+  // ------------------------------------------------------------- import
+  /** 上传用户选择的 ZIP 到 Host 受控临时目录，返回可引用的 zipPath（dsh-ssh 同款原始字节上传） */
+  async upload(file: File): Promise<UploadResponse> {
+    // 上传大 ZIP 可能较慢：长操作档位（5 分钟）。
+    return requestJson<UploadResponse>(
+      CONFIG_MANAGER_API.upload + query({ name: file.name }),
+      { method: 'POST', body: file },
+      this.t,
+      LONG_OPTS,
+    );
+  }
+
+  /**
+   * ImportPort.analyzeImport：零写入分析（校验/兼容性/差异/路径/秘密检测）。
+   *
+   * `opts.decryptPassword`（仅内存）：提供即让宿主解开 secrets.enc，把
+   * `analysis.credentials`（仅 ref 名）一并回传（issue #39 Feature 2）——
+   * 客户端不必自己解析 .credentials.yaml。不传 = refs 为空数组。
+   */
+  async analyzeImport(zipPath: string, opts: { decryptPassword?: string } = {}): Promise<ImportAnalysis> {
+    return postJson<ImportAnalysis>(
+      CONFIG_MANAGER_API.analyze,
+      {
+        zipPath,
+        ...(opts.decryptPassword !== undefined && opts.decryptPassword !== ''
+          ? { decryptPassword: opts.decryptPassword }
+          : {}),
+      },
+      this.t,
+      LONG_OPTS,
+    );
+  }
+
+  /**
+   * ImportPort.createImportPlan：用用户决策（冲突/路径映射/策略）生成最终计划（Dry Run 零写入）。
+   * `opts.decryptPassword`（仅内存）：加密备份必须与 /analyze、/execute 传同一个密码，
+   * 让计划包含「归档里带值的凭据」——否则导入时这些值不会被写回。
+   */
+  async createImportPlan(
+    zipPath: string,
+    decisions: ImportDecisions,
+    opts: { decryptPassword?: string; sessionFormatDisposition?: SessionFormatDisposition } = {},
+  ): Promise<ImportPlan> {
+    return postJson<ImportPlan>(
+      CONFIG_MANAGER_API.plan,
+      {
+        zipPath,
+        decisions,
+        ...(opts.decryptPassword !== undefined && opts.decryptPassword !== ''
+          ? { decryptPassword: opts.decryptPassword }
+          : {}),
+        // T1 处置：缺省由宿主决定（插件配置项 → abort）。只有调用方显式给了才下发，
+        // 这样旧客户端（不带该字段）的语义完全不变。
+        ...(opts.sessionFormatDisposition !== undefined
+          ? { sessionFormatDisposition: opts.sessionFormatDisposition }
+          : {}),
+      },
+      this.t,
+      LONG_OPTS,
+    );
+  }
+
+  /** ImportPort.decryptArchive：解锁整体加密备份容器 → 明文 ZIP 路径 + 解密覆盖的凭据 ref 名 */
+  async decryptArchive(zipPath: string, password: string): Promise<DecryptArchiveResponse> {
+    return postJson<DecryptArchiveResponse>(CONFIG_MANAGER_API.decryptArchive, { zipPath, password }, this.t, LONG_OPTS);
+  }
+
+  /** ImportPort.executeImportPlan：快照→分阶段 apply→validate→commit/rollback */
+  async executeImportPlan(
+    zipPath: string,
+    plan: ImportPlan,
+    opts: {
+      confirm: boolean
+      secretInputs?: Record<string, string>
+      rollbackOnError: boolean
+      decryptPassword?: string
+      sessionFormatDisposition?: SessionFormatDisposition
+    },
+  ): Promise<ImportResult & { runId: string }> {
+    const payload: ExecutePayload = {
+      zipPath,
+      plan,
+      opts: {
+        confirm: opts.confirm,
+        secretInputs: opts.secretInputs ?? {},
+        rollbackOnError: opts.rollbackOnError,
+        decryptPassword: opts.decryptPassword,
+        sessionFormatDisposition: opts.sessionFormatDisposition,
+      },
+    };
+    return postJson<ImportResult & { runId: string }>(CONFIG_MANAGER_API.execute, payload, this.t, LONG_OPTS);
+  }
+
+  // ------------------------------------------------------------- run 进度
+  /**
+   * m1：查询单个 run 的实时状态（执行中轮询 / 刷新恢复用；404 = 已过保留期或不存在）。
+   *
+   * 超时用**普通档位**（30s）：`run-store.pollRun` 只在 promise 拒绝时才走 `applyGone`
+   * （把 run 判为「已结束/不可恢复」并停止轮询），所以这里必须**有界**但不能过短 ——
+   * 宿主事件循环被大操作短暂占住时，误报的代价（丢掉进度跟踪）高于晚 30 秒收敛。
+   */
+  async progress(runId: string): Promise<RunState> {
+    return getJson<RunState>(CONFIG_MANAGER_API.progress + query({ runId }), this.t);
+  }
+
+  /** m1：列出当前活跃（running）的 run（刷新后重新订阅进行中任务的入口；超时同上）。 */
+  async runs(): Promise<RunState[]> {
+    return getJson<RunState[]>(CONFIG_MANAGER_API.runs, this.t);
+  }
+
+  /** 导入中「跳过当前插件」：宿主 abort 当前计划项的中止控制器（kill 子进程 + 清半装状态）。
+   * 404 = run 不在执行（已完成/无进行中导入）。 */
+  async skipExecute(runId: string): Promise<{ skipped: boolean }> {
+    return postJson<{ skipped: boolean }>(CONFIG_MANAGER_API.skipExecute, { runId }, this.t, LONG_OPTS);
+  }
+
+  /**
+   * 运行中心：列出最近的 run（含刚结束的；终态受宿主保留期约束，**不是**持久审计）。
+   * 一次拿全「进行中 + 刚结束」，避免运行中心同时开两条轮询链。
+   */
+  async runsRecent(): Promise<RunState[]> {
+    return getJson<RunState[]>(CONFIG_MANAGER_API.runs + query({ scope: 'recent' }), this.t);
+  }
+
+  /**
+   * 运行中心：请求终止。协作式取消 —— 宿主在**计划项边界**暂停并把 run 置为「待决策」，
+   * 由 decideRunCancel 回传处置方式。409 = 该任务类型没有安全点（目前只有导入支持）。
+   */
+  async cancelRun(runId: string): Promise<{ requested: boolean }> {
+    return postJson<{ requested: boolean }>(CONFIG_MANAGER_API.runsCancel, { runId }, this.t, LONG_OPTS);
+  }
+
+  /** 运行中心：把「回滚 / 保留已应用项」的选择回传给停在安全点的引擎。 */
+  async decideRunCancel(runId: string, decision: 'rollback' | 'keep'): Promise<{ accepted: boolean }> {
+    return postJson<{ accepted: boolean }>(CONFIG_MANAGER_API.runsCancelDecision, { runId, decision }, this.t, LONG_OPTS);
+  }
+
+  // ------------------------------------------------------- 快照恢复（M4）
+  /** 列出全部快照元信息（createdAt 倒序；含 status/条目数/宿主文件数/插件数） */
+  async snapshots(): Promise<SnapshotMeta[]> {
+    return (await this.snapshotsDetailed()).snapshots;
+  }
+
+  /**
+   * 同 `snapshots()`，但把「快照目录读不出来」的事实一并带回（宿主 out.unreadable 透传）。
+   * 为什么需要：读不出来与「没有快照」必须分清 —— 只拿数组会让界面把 EACCES 渲染成空列表。
+   */
+  async snapshotsDetailed(): Promise<{ snapshots: SnapshotMeta[]; unreadable: string | null }> {
+    const body = await getJson<{ snapshots: SnapshotMeta[]; unreadable?: string | null }>(CONFIG_MANAGER_API.snapshots, this.t);
+    return { snapshots: body.snapshots, unreadable: body.unreadable ?? null };
+  }
+
+  /** 快照恢复：dryRun=true 只取动作计划（零写入）；false 执行并返回诚实报告 */
+  async restoreSnapshot(snapshotId: string, dryRun: boolean, planFingerprint?: string): Promise<RestoreResponse> {
+    // planFingerprint 只在**执行**时回传（预览时没有意义）；缺省不下发 = 旧宿主/旧调用点行为不变。
+    const body = planFingerprint !== undefined ? { snapshotId, dryRun, planFingerprint } : { snapshotId, dryRun };
+    return postJson<RestoreResponse>(CONFIG_MANAGER_API.restore, body, this.t, LONG_OPTS);
+  }
+
+  /**
+   * git 风格恢复预览：单个文件的逐行差异（只读，零写入）。
+   * before = 当前磁盘文件 / after = 快照 blob；越界 / 二进制 / 超限经响应里的 reason 表达。
+   */
+  async snapshotFileDiff(payload: {
+    snapshotId: string;
+    kind: SnapshotFileDiff['kind'];
+    target?: string;
+    blobPath?: string;
+  }): Promise<SnapshotFileDiff> {
+    const body = await postJson<{ diff: SnapshotFileDiff }>(CONFIG_MANAGER_API.snapshotFileDiff, payload, this.t);
+    return body.diff;
+  }
+
+  /** P1-⑧：手动删除单个快照（危险操作：该导入前回滚点不可恢复；`removed` 为是否实际删除）。 */
+  async deleteSnapshot(snapshotId: string): Promise<{ removed: boolean }> {
+    return postJson<{ ok: boolean; removed: boolean }>(CONFIG_MANAGER_API.snapshotDelete, { snapshotId }, this.t);
+  }
+
+  /** P1-⑧：置顶/取消置顶快照（置顶快照豁免自动保留清理，只能手动删除）。 */
+  async setSnapshotPinned(snapshotId: string, pinned: boolean): Promise<{ pinned: boolean }> {
+    return postJson<{ ok: boolean; pinned: boolean }>(CONFIG_MANAGER_API.snapshotPin, { snapshotId, pinned }, this.t);
+  }
+
+  // ------------------------------------------------- 档案（DSH 自带 profile）
+  /** 列出 DSH profile：列表 + 当前运行 + 在跑的实例（台账 ∪ 心跳）+ 起步模板。 */
+  async profilesList(): Promise<DshProfilesSnapshot> {
+    return getJson<DshProfilesSnapshot & { ok: boolean }>(CONFIG_MANAGER_API.profiles, this.t);
+  }
+
+  /** 单个档案详情（package.json / cordis.patch.yml 原文；大文件原文截断为 null）。 */
+  async profileDetail(name: string): Promise<DshProfileDetail> {
+    const body = await getJson<{ ok: boolean; profile: DshProfileDetail }>(
+      `${CONFIG_MANAGER_API.profilesDetail}?name=${encodeURIComponent(name)}`,
+      this.t,
+    );
+    return body.profile;
+  }
+
+  /** 新建档案（在 $DSH_HOME/profiles/<name> 写标准 profile 三件套；template = base/web/headless/sdk/…）。 */
+  async profileCreate(name: string, template: string): Promise<DshProfileMeta> {
+    const body = await postJson<{ ok: boolean; profile: DshProfileMeta }>(CONFIG_MANAGER_API.profilesCreate, { name, template }, this.t);
+    return body.profile;
+  }
+
+  /**
+   * 复制档案：整份拷贝成新档案（package.json 的 name 跟随改写）。
+   * includeNodeModules 缺省 true —— 副本立刻可用，但 285 MB 级档案实测要三十秒上下（走长操作档位）；
+   * 传 false 只拷清单与 patch（秒级），回执 copy.warnings 会带 depsNotInstalled，调用方必须如实展示。
+   */
+  async profileCopy(name: string, newName: string, opts: { includeNodeModules?: boolean } = {}): Promise<{ profile: DshProfileMeta; copy: DshProfileCopyResult }> {
+    const body = await postJson<{ ok: boolean; profile: DshProfileMeta; copy: DshProfileCopyResult }>(
+      CONFIG_MANAGER_API.profilesCopy,
+      { name, newName, includeNodeModules: opts.includeNodeModules !== false },
+      this.t,
+      LONG_OPTS,
+    );
+    return { profile: body.profile, copy: body.copy };
+  }
+
+  /** 重命名档案（目录级移动；当前运行中的档案被 host 拒绝）。 */
+  async profileRename(name: string, newName: string): Promise<DshProfileMeta> {
+    const body = await postJson<{ ok: boolean; profile: DshProfileMeta }>(CONFIG_MANAGER_API.profilesRename, { name, newName }, this.t);
+    return body.profile;
+  }
+
+  /** 物理删除档案目录（不可恢复；当前运行中的档案需显式 allowCurrent=true）。 */
+  async profileDelete(name: string, opts: { allowCurrent?: boolean } = {}): Promise<void> {
+    await postJson<{ ok: boolean }>(
+      CONFIG_MANAGER_API.profilesDelete,
+      { name, allowCurrent: opts.allowCurrent === true },
+      this.t,
+    );
+  }
+
+  /**
+   * 停掉该档案的实例：本插件启动的走台账，**别处/手动启动的**走心跳（同样按 pid 停）。
+   * 返回停止后的运行中实例列表 —— UI 据此把该行按钮换回「启动」。
+   */
+  async profileStop(name: string): Promise<{ result: DshProfileStopOutcome; running: DshProfileRunningView[] }> {
+    const body = await postJson<{ ok: boolean; stopped: { result: DshProfileStopOutcome }; running: DshProfileRunningView[] }>(
+      CONFIG_MANAGER_API.profilesStop, { name }, this.t, LONG_OPTS,
+    );
+    return { result: body.stopped.result, running: body.running ?? [] };
+  }
+
+  /**
+   * 用该档案启动一个**独立 DSH 实例**（"切换档案"真正可用的形态；DSH 没有默认 profile 状态）。
+   * 只支持 web 形态档案；host 要等子进程起来（最长 20s 探活）→ 长操作档位。
+   * 同时返回启动后的 running 列表：UI 立刻把该行按钮换成「停止」，不必再 GET 一次。
+   */
+  async profileLaunch(name: string): Promise<{ launch: DshProfileLaunchResult; running: DshProfileRunningView[] }> {
+    const body = await postJson<{ ok: boolean; launch: DshProfileLaunchResult; running: DshProfileRunningView[] }>(CONFIG_MANAGER_API.profilesLaunch, { name }, this.t, LONG_OPTS);
+    return { launch: body.launch, running: body.running ?? [] };
+  }
+
+  // ------------------------------------------------- 定时全量备份（快照 tab）
+  /** 读取定时备份配置（enabled / interval / 上次运行状态；无敏感字段）。 */
+  async backupSchedule(): Promise<BackupScheduleStatus> {
+    const body = await getJson<{ schedule: BackupScheduleStatus }>(CONFIG_MANAGER_API.backupSchedule, this.t);
+    return body.schedule;
+  }
+
+  /** 保存定时备份设置（enabled + interval）；Host 校验后原子写 + 重排调度器。 */
+  async saveBackupSchedule(draft: BackupScheduleDraft): Promise<BackupScheduleStatus> {
+    const body = await requestJson<{ schedule: BackupScheduleStatus }>(
+      CONFIG_MANAGER_API.backupSchedule,
+      { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(draft) },
+      this.t,
+    );
+    return body.schedule;
+  }
+
+  /** 立即执行一次全量备份（复用调度器 runOnce，防重；返回执行结果 + 最新配置）。 */
+  async runBackupNow(): Promise<{ run: BackupRunResult; schedule: BackupScheduleStatus }> {
+    // 立即全量备份可能跑数分钟：长操作档位。
+    return postJson<{ run: BackupRunResult; schedule: BackupScheduleStatus }>(CONFIG_MANAGER_API.backupScheduleRun, {}, this.t, LONG_OPTS);
+  }
+
+  // ------------------------------------------------- 备份文件管理（快照 tab）
+  /** 列出导出目录（exports/*.zip）下的全部备份文件（时间倒序；含来源 auto/manual）。 */
+  async listBackupFiles(): Promise<BackupFileMeta[]> {
+    const body = await getJson<{ ok: boolean; files: BackupFileMeta[] }>(CONFIG_MANAGER_API.backupFiles, this.t);
+    return body.files;
+  }
+
+  /** 删除一个备份文件（危险操作：不可恢复；仅限 exports 目录内 .zip）。 */
+  async deleteBackupFile(name: string): Promise<{ removed: boolean }> {
+    return postJson<{ ok: boolean; removed: boolean }>(CONFIG_MANAGER_API.backupFilesDelete, { name }, this.t);
+  }
+
+  // ------------------------------------------------- 磁盘占用体检（快照 tab）
+  /** 磁盘占用体检（只读）：按子区回传字节/文件数 + 各保留期的「已到期」量。 */
+  async getDiskUsage(): Promise<DiskUsageReport> {
+    const body = await getJson<{ ok: boolean; report: DiskUsageReport }>(CONFIG_MANAGER_API.diskUsage, this.t);
+    return body.report;
+  }
+
+  /**
+   * 手动清理缓存与暂存（走 mutation gate）。
+   * 缺省只清可重建区（tmp + 市场缓存/工作副本）；`categories` 可加入 'expired-exports'
+   * 只删**已超保留期**的导出产物。snapshots / sync 永不在候选集内。
+   */
+  async cleanupDiskUsage(categories: Array<'tmp' | 'expired-exports'>): Promise<DiskUsageCleanupResult> {
+    return postJson<DiskUsageCleanupResult>(CONFIG_MANAGER_API.diskUsageCleanup, { categories }, this.t);
+  }
+
+  // ------------------------------------------------- 插件版本更新检查（关于 tab）
+  /**
+   * 只读检查 npm 上是否有新版本（GET /update-check）。
+   *
+   * `force=false`（缺省）命中宿主 10 分钟内的进程内缓存；`force=true` 绕过缓存重新探测
+   * （用户在「关于」页点「重新检查」）。离线 / registry 不可达时返回 `ok:false` + 原因
+   * —— 界面显示可重试提示，不当作错误横幅。
+   */
+  async checkUpdate(force = false): Promise<PluginUpdateCheckResult> {
+    const url = force ? `${CONFIG_MANAGER_API.updateCheck}?force=1` : CONFIG_MANAGER_API.updateCheck;
+    return getJson<PluginUpdateCheckResult>(url, this.t);
+  }
+
+  /**
+   * 执行插件自更新（POST /update-apply）—— **只在用户显式点「立即更新」后**调用。
+   *
+   * 宿主经官方 dsh plugin 通道安装钉住的精确版本（见 core/self-update.ts）；成功后必须
+   * 重启 DSH 才生效。安装可能较慢（慢网络下分钟级），故用独立的长超时档位。
+   */
+  async applyUpdate(version: string): Promise<PluginUpdateApplyResult> {
+    return postJson<PluginUpdateApplyResult>(CONFIG_MANAGER_API.updateApply, { version }, this.t, SELF_UPDATE_OPTS);
+  }
+
+  // ------------------------------------------------- Phase 7 迁移前咨询
+  /** 迁移前咨询（只读健康评分 + 建议）：对 4 种可迁移源生成统一咨询报告。 */
+  async consult(input: { type: 'export-zip' | 'local-snapshot' | 'remote-snapshot' | 'profile'; id: string; snapshotId?: string }): Promise<ConsultReport> {
+    // 只读咨询要读备份/快照内容：长操作档位。
+    return postJson<ConsultReport>(CONFIG_MANAGER_API.consult, input, this.t, LONG_OPTS);
+  }
+
+  // ------------------------------------------------- 外部 agent 来源（t17）
+  /**
+   * GET /foreign-sources：六来源的本机检测结果（**只读**，零写入）。
+   *
+   * 未安装是正常状态（found=false），不是错误 —— 界面照常列出全部六条，
+   * 用户才知道「哪些查过了、本机确实没有」。
+   */
+  async foreignSources(opts: { projectDir?: string } = {}): Promise<ForeignSourcesResponse> {
+    const q = opts.projectDir !== undefined && opts.projectDir !== ''
+      ? query({ projectDir: opts.projectDir })
+      : ''
+    return getJson<ForeignSourcesResponse>(CONFIG_MANAGER_API.foreignSources + q, this.t, LONG_OPTS);
+  }
+
+  /**
+   * POST /foreign-import：把本机某个外部 agent 的配置翻译成标准 bundle v1 ZIP，
+   * 落到宿主受控临时目录并返回 zipPath —— 之后**完全复用既有导入向导**
+   * （analyzeImport → createImportPlan → executeImportPlan），不新建第二套向导。
+   *
+   * 为什么必须由宿主产包：转换要读本机文件系统并写 ZIP，浏览器半做不了
+   * （此前该能力只在 CLI 里，GUI 会在「点导入」之后断链）。
+   *
+   * `projectDir`：项目级真值位置（Cursor/Codex 的 <项目>/.cursor/**）。**缺省不传 = 不扫项目级** ——
+   * 宿主进程的 cwd 不是用户的项目，绝不猜。
+   *
+   * 响应**绝不含凭据值**：只有 skipped 机器码与凭据**引用名**（值在转换层已被剥离）。
+   */
+  async foreignImport(source: string, opts: { projectDir?: string } = {}): Promise<ForeignImportResponse> {
+    return postJson<ForeignImportResponse>(
+      CONFIG_MANAGER_API.foreignImport,
+      {
+        source,
+        ...(opts.projectDir !== undefined && opts.projectDir !== '' ? { projectDir: opts.projectDir } : {}),
+      },
+      this.t,
+      LONG_OPTS,
+    );
+  }
+
+  // ------------------------------------------------- F-2 官方 session.export 通道
+  /**
+   * GET /session-export（**只读**）：探测 DSH 官方 session.export 端的可用性。
+   *
+   * 为什么由宿主代探而不是浏览器直接打 DSH：见 src/routes/session-export.ts 的文件头 ——
+   * 该端点挂在带浏览器认证的 `/api` 前缀下，浏览器侧「401 / 404 / 连不上」分不开，
+   * 而「路由没注册」与「持久化后端缺服务」的处理方式**完全不同**（前者保守显示、后者隐藏入口）。
+   *
+   * 返回三态（**绝不二值化**）：`available` 显示 / `unavailable` 禁用并说明原因 / `unknown` 保守显示。
+   */
+  async sessionExportProbe(): Promise<SessionExportProbe> {
+    const body = await getJson<{ ok: boolean } & SessionExportProbe>(CONFIG_MANAGER_API.sessionExport, this.t);
+    return {
+      availability: body.availability,
+      ...(body.reason === undefined ? {} : { reason: body.reason }),
+      status: body.status,
+      path: body.path,
+      checkedAt: body.checkedAt,
+    };
+  }
+
+  /** F-2：原始日志 ZIP 的代理下载地址（探测与下载同一条路由，query 决定形态）。 */
+  sessionExportUrl(sessionId: string, opts: { includeDescendants?: boolean } = {}): string {
+    const descendants = opts.includeDescendants !== false ? 'true' : 'false';
+    return `${CONFIG_MANAGER_API.sessionExport}?sessionId=${encodeURIComponent(sessionId)}&includeDescendants=${descendants}`;
+  }
+
+  /**
+   * F-2：把某条会话的原始日志 ZIP 下载到本机（由 DSH 自己打包，含子会话与附件）。
+   *
+   * 复用**既有**的流式下载链路（openStream + saveDownloaded，与导出产物同一条）：
+   *  - 大 ZIP 不整本驻留内存（流式写优先，不可用时才 Blob 兜底）；
+   *  - 正文阶段是**空闲超时**（每读一块重置）—— 宿主卡死时明确失败而非永久转圈；
+   *  - 失败时把上游（DSH）的状态码与正文如实抛出（代理路由原样透传，见 src/routes/session-export.ts）。
+   *
+   * 为什么走本插件的代理而不是直连 DSH 的 `/api/session.export`：`openStream` 认得本插件的
+   * 错误信封；直连 DSH 时 401/404 只是一次没有解释的失败（而 404 也可能是「拼错路径」）。
+   */
+  async downloadSessionExport(
+    sessionId: string,
+    opts?: DownloadOptions,
+    onProgress?: (received: number, total: number) => void,
+  ): Promise<DownloadResult> {
+    const stream = await openStream(this.sessionExportUrl(sessionId), this.t);
+    try {
+      return await this.saveDownloaded(stream, 'dsh-session-' + sessionId + '.zip', opts, onProgress);
+    } catch (err) {
+      throw stream.mapTimeout(err);
+    } finally {
+      stream.close();
+    }
+  }
+
+  // ------------------------------------------------- P1-⑦/P2-⑬ 备份内容查看 / 差异对比
+  /** 「查看备份内容」：对 exports 目录内的备份文件做只读分析（reuse /analyze，零写入）。
+   *  返回分析 + 与当前配置的差异计划摘要（"装/导这个备份会动你什么"）。 */
+  async inspectBackup(zipPath: string): Promise<BackupInspectResult> {
+    // 1) 只读分析（分区清单 / 兼容性 / 路径 / 密钥数）
+    const analysis = await this.analyzeImport(zipPath);
+    // 2) 差异计划（merge 策略，零写入）：将更新的项 / 已一致的项 / 冲突等。
+    //    这里显式用 **'guide'** 处置：本方法只做**只读查看**（零写入），没有、也不该有
+    //    「中止 / 跳过 / 引导」的决策界面；若沿用缺省 abort，用户连「看看这个备份里有什么」
+    //    都会被 409 挡住（T1 的阻断只应发生在真正要写盘的导入/同步路径上）。
+    const plan = await this.createImportPlan(zipPath, {
+      strategy: 'merge',
+      resolutions: {},
+      pathMappings: [],
+    }, { sessionFormatDisposition: 'guide' });
+    return { analysis, plan };
+  }
+}

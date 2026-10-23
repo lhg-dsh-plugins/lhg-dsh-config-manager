@@ -1,0 +1,56 @@
+# Dependencies
+node_modules/
+
+# Build output
+lib/
+dist/
+*.tsbuildinfo
+
+# Node.js 模块编译缓存（NODE_COMPILE_CACHE 指向相对路径时落在 cwd；纯本地工具产物、内容是 V8 不透明 blob）
+node-compile-cache/
+
+# Vibe governance / team runtime state (local only, contains absolute paths)
+.vibeskills/
+.agent-teams/
+.codegraph/
+outputs/
+my-video/
+
+# Packaging artifacts
+*.tgz
+*.zip
+*.tar.gz
+
+# Logs & OS junk
+*.log
+.DS_Store
+Thumbs.db
+
+# Local env
+.env
+.env.local
+
+# Phase 4 real-DSH E2E isolated environment
+phase4-e2e/
+# Phase 5 real-DSH E2E isolated environment
+phase5-e2e/
+# Phase 6 real-DSH E2E isolated environment
+phase6-e2e/
+# Phase 7 real-DSH E2E isolated environment
+phase7-e2e/
+# Phase 8 real-DSH E2E isolated environment
+phase8-e2e/
+
+# UI rebuild QA sandbox (isolated DSH instance + screenshots)
+.qa/
+
+# Vision-router crop artifacts (local tooling output from browser visual QA)
+.dsh-vision-router/
+
+# Local scratch (temp build dirs, tool dumps, pre-edit backups) — never commit
+.tmp/
+undefined/
+.tmp-*
+
+# 文件编辑工具的临时锁文件（零字节、写完即删；漏留时别提交）
+.dsh-ops-update-*.lock

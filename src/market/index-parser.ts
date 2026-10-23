@@ -1,0 +1,291 @@
+/**
+ * m-market：index.json（L1）与 items/<id>/manifest.json（L2）的纯字符串级解析与校验。
+ * 零 fs、零副作用、node 可测。返回 ok/errors，绝不抛错（调用方决定如何呈现）。
+ *
+ * 安全纪律：
+ *  - 深度保护解析（parseJsonSafe）；
+ *  - 字段白名单：允许字段之外的多出字段一律进 errors（拒绝，不忽略 —— 防字段渗透）；
+ *  - schemaVersion === 1 强制；
+ *  - items 每项 id 过 SAFE_ITEM_ID_RE；
+ *  - items 每项 repo（可选来源仓库）必须过 validateRepoUrl：非法条目**仅丢弃该条目**，
+ *    不整体拒绝 index（防止恶意/失效引用进入浏览列表，同时不因单条坏引用弄垮整个市场）。
+ */
+import { parseJsonSafe } from '../utils/json.ts';
+import { validateMarketRepoUrl } from './url.ts';
+import { SAFE_ITEM_ID_RE, MARKET_INDEX_SCHEMA_VERSION, MARKET_ITEM_SCHEMA_VERSION } from './types.ts';
+import type {
+  MarketIndex, MarketIndexItem, MarketItemManifest, ParseIndexResult, ParseItemManifestResult,
+} from './types.ts';
+import { SECTION_IDS } from '../schema/config.ts';
+import type { SectionId } from '../schema/types.ts';
+import { marketMsg } from './messages-market.ts';
+
+const INDEX_ALLOWED = new Set(['schemaVersion', 'name', 'description', 'items']);
+const INDEX_ITEM_ALLOWED = new Set(['id', 'name', 'description', 'author', 'version', 'updatedAt', 'categories', 'repo']);
+const MANIFEST_ALLOWED = new Set([
+  'schemaVersion', 'id', 'name', 'version', 'author', 'description', 'updatedAt',
+  'categories', 'mode', 'sections', 'provenance', 'checksums',
+]);
+const PROVENANCE_ALLOWED = new Set(['source', 'note']);
+const CHECKSUMS_ALLOWED = new Set(['zip']);
+
+/** 校验未知字段；返回多余字段名数组（非空 → 拒绝） */
+function unknownFields(obj: Record<string, unknown>, allowed: Set<string>): string[] {
+  return Object.keys(obj).filter((k) => !allowed.has(k));
+}
+
+/** 可选字符串字段：合法非空字符串则取，否则 null；非字符串 → errors（拒绝） */
+function optString(obj: Record<string, unknown>, key: string, errors: string[], path: string): string | undefined {
+  const v = obj[key];
+  if (v === undefined) return undefined;
+  if (typeof v !== 'string') {
+    errors.push(marketMsg('market.index.fieldMustBeString', { path: `${path}.${key}` }));
+    return undefined;
+  }
+  return v;
+}
+
+/** 可选字符串数组字段（categories）：数组且全为字符串，否则 errors */
+function optStringArray(obj: Record<string, unknown>, key: string, errors: string[], path: string): string[] | undefined {
+  const v = obj[key];
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) {
+    errors.push(marketMsg('market.index.fieldMustBeStringArray', { path: `${path}.${key}` }));
+    return undefined;
+  }
+  return v as string[];
+}
+
+/**
+ * 解析并校验单条 MarketIndexItem（L1）；非法返回 null + errors。
+ * repo 非法（未过 validateRepoUrl）属「该条目不可用」：计入 dropped 计数并返回 null，
+ * 不向 errors 写任何内容 —— 调用方据此只丢弃该条目、不整体拒绝 index。
+ */
+function parseIndexItem(raw: unknown, errors: string[], inPath: string, dropped: { n: number }): MarketIndexItem | null {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    errors.push(marketMsg('market.index.mustBeObject', { path: inPath }));
+    return null;
+  }
+  const obj = raw as Record<string, unknown>;
+  const uf = unknownFields(obj, INDEX_ITEM_ALLOWED);
+  if (uf.length > 0) {
+    errors.push(marketMsg('market.index.unknownFields', { path: inPath, fields: uf.join(', ') }));
+    return null;
+  }
+  const id = obj['id'];
+  if (typeof id !== 'string' || !SAFE_ITEM_ID_RE.test(id)) {
+    errors.push(marketMsg('market.index.idInvalid', { path: inPath, id: JSON.stringify(id) }));
+    return null;
+  }
+  const name = obj['name'];
+  if (typeof name !== 'string' || name === '') {
+    errors.push(marketMsg('market.index.nameEmpty', { path: inPath }));
+    return null;
+  }
+  // repo 可选：条目来源仓库（发布者自托管）。非法（含 userinfo / 空白 / 非字符串）→ 仅丢弃该条目。
+  let repo: string | undefined;
+  const repoVal = obj['repo'];
+  if (repoVal !== undefined) {
+    if (typeof repoVal !== 'string' || validateMarketRepoUrl(repoVal) !== null) {
+      dropped.n += 1;
+      return null;
+    }
+    repo = repoVal;
+  }
+  return {
+    id,
+    name,
+    description: optString(obj, 'description', errors, inPath),
+    author: optString(obj, 'author', errors, inPath),
+    version: optString(obj, 'version', errors, inPath),
+    updatedAt: optString(obj, 'updatedAt', errors, inPath),
+    categories: optStringArray(obj, 'categories', errors, inPath),
+    ...(repo !== undefined ? { repo } : {}),
+  };
+}
+
+/**
+ * 解析市场目录 index.json（L1）。未知字段/越界字段一律进 errors（拒绝，不忽略）。
+ * 深度保护 + 字段白名单 + schemaVersion===1 + items 每项 id 过 SAFE_ITEM_ID_RE。
+ */
+export function parseMarketIndex(raw: string): ParseIndexResult {
+  if (typeof raw !== 'string' || raw === '') {
+    return { ok: false, index: null, errors: [marketMsg('market.index.contentEmpty')] };
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseJsonSafe(raw);
+  } catch (err) {
+    return { ok: false, index: null, errors: [marketMsg('market.index.parseFailed', { reason: err instanceof Error ? err.message : String(err) })] };
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, index: null, errors: [marketMsg('market.index.rootNotObject')] };
+  }
+  const obj = parsed as Record<string, unknown>;
+  const errors: string[] = [];
+
+  const uf = unknownFields(obj, INDEX_ALLOWED);
+  if (uf.length > 0) {
+    return { ok: false, index: null, errors: [marketMsg('market.index.rootUnknownFields', { fields: uf.join(', ') })] };
+  }
+  if (obj['schemaVersion'] !== MARKET_INDEX_SCHEMA_VERSION) {
+    return { ok: false, index: null, errors: [marketMsg('market.index.schemaVersion', { expected: MARKET_INDEX_SCHEMA_VERSION, actual: String(obj['schemaVersion']) })] };
+  }
+  if (obj['items'] === undefined || !Array.isArray(obj['items'])) {
+    return { ok: false, index: null, errors: [marketMsg('market.index.itemsMissing')] };
+  }
+  const items: MarketIndexItem[] = [];
+  const dropped = { n: 0 };
+  (obj['items'] as unknown[]).forEach((item, i) => {
+    const parsedItem = parseIndexItem(item, errors, `items[${i}]`, dropped);
+    if (parsedItem !== null) items.push(parsedItem);
+  });
+  if (errors.length > 0) {
+    return { ok: false, index: null, errors };
+  }
+  const index: MarketIndex = {
+    schemaVersion: MARKET_INDEX_SCHEMA_VERSION,
+    name: optString(obj, 'name', errors, '$'),
+    description: optString(obj, 'description', errors, '$'),
+    items,
+  };
+  if (errors.length > 0) return { ok: false, index: null, errors };
+  return {
+    ok: true,
+    index,
+    errors: [],
+    ...(dropped.n > 0 ? { dropped: dropped.n } : {}),
+  };
+}
+
+/**
+ * 解析单条目清单 items/<id>/manifest.json（L2）。
+ * 未知字段/越界字段一律进 errors；id 必须过 SAFE_ITEM_ID_RE；
+ * sections 每项必须 ∈ SECTION_IDS；checksums.zip 必须为非空字符串；
+ * mode（可选，发布模式标记）取值必须 ∈ migrate | share —— 与 prepare 的写入侧同源。
+ */
+export function parseMarketItemManifest(raw: string): ParseItemManifestResult {
+  if (typeof raw !== 'string' || raw === '') {
+    return { ok: false, manifest: null, errors: [marketMsg('market.manifest.contentEmpty')] };
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseJsonSafe(raw);
+  } catch (err) {
+    return { ok: false, manifest: null, errors: [marketMsg('market.manifest.parseFailed', { reason: err instanceof Error ? err.message : String(err) })] };
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, manifest: null, errors: [marketMsg('market.manifest.rootNotObject')] };
+  }
+  const obj = parsed as Record<string, unknown>;
+  const errors: string[] = [];
+
+  const uf = unknownFields(obj, MANIFEST_ALLOWED);
+  if (uf.length > 0) {
+    return { ok: false, manifest: null, errors: [marketMsg('market.manifest.unknownFields', { fields: uf.join(', ') })] };
+  }
+  if (obj['schemaVersion'] !== MARKET_ITEM_SCHEMA_VERSION) {
+    return { ok: false, manifest: null, errors: [marketMsg('market.manifest.schemaVersion', { expected: MARKET_ITEM_SCHEMA_VERSION, actual: String(obj['schemaVersion']) })] };
+  }
+  const id = obj['id'];
+  if (typeof id !== 'string' || !SAFE_ITEM_ID_RE.test(id)) {
+    return { ok: false, manifest: null, errors: [marketMsg('market.manifest.idInvalid', { id: JSON.stringify(id) })] };
+  }
+  const name = obj['name'];
+  if (typeof name !== 'string' || name === '') {
+    return { ok: false, manifest: null, errors: [marketMsg('market.manifest.nameEmpty')] };
+  }
+  const version = obj['version'];
+  if (typeof version !== 'string' || version === '') {
+    return { ok: false, manifest: null, errors: [marketMsg('market.manifest.versionEmpty')] };
+  }
+  if (!Array.isArray(obj['sections']) || obj['sections'].some((s) => typeof s !== 'string')) {
+    return { ok: false, manifest: null, errors: [marketMsg('market.manifest.sectionsNotArray')] };
+  }
+  const sections = obj['sections'] as unknown[];
+  for (const s of sections) {
+    if (!(SECTION_IDS as readonly string[]).includes(s as string)) {
+      return { ok: false, manifest: null, errors: [marketMsg('market.manifest.unknownSection', { section: String(s) })] };
+    }
+  }
+  // 可选发布模式：仅接受 migrate | share。发布侧 prepare 在 share 模式会写入该字段
+  //（缺失 = migrate 缺省，向后兼容既有产物）；非法取值必须拒绝，不得静默忽略。
+  let mode: MarketItemManifest['mode'];
+  if (obj['mode'] !== undefined) {
+    const rawMode = obj['mode'];
+    // 逐字面量比较（不用 `as`）：MarketPublishMode 若新增/改名取值，赋值处会编译失败，
+    // 白名单与类型不会各自漂移。
+    if (rawMode !== 'migrate' && rawMode !== 'share') {
+      return { ok: false, manifest: null, errors: [marketMsg('market.manifest.modeInvalid', { mode: JSON.stringify(rawMode) })] };
+    }
+    mode = rawMode;
+  }
+
+  const checksums = obj['checksums'];
+  if (checksums === null || typeof checksums !== 'object' || Array.isArray(checksums)) {
+    return { ok: false, manifest: null, errors: [marketMsg('market.manifest.checksumsNotObject')] };
+  }
+  const csObj = checksums as Record<string, unknown>;
+  const csUf = unknownFields(csObj, CHECKSUMS_ALLOWED);
+  if (csUf.length > 0) {
+    return { ok: false, manifest: null, errors: [marketMsg('market.manifest.checksumsUnknownFields', { fields: csUf.join(', ') })] };
+  }
+  const zip = csObj['zip'];
+  if (typeof zip !== 'string' || zip === '') {
+    return { ok: false, manifest: null, errors: [marketMsg('market.manifest.checksumsZipEmpty')] };
+  }
+
+  let provenance: MarketItemManifest['provenance'];
+  if (obj['provenance'] !== undefined) {
+    const p = obj['provenance'];
+    if (p === null || typeof p !== 'object' || Array.isArray(p)) {
+      return { ok: false, manifest: null, errors: [marketMsg('market.manifest.provenanceNotObject')] };
+    }
+    const pObj = p as Record<string, unknown>;
+    const pUf = unknownFields(pObj, PROVENANCE_ALLOWED);
+    if (pUf.length > 0) {
+      return { ok: false, manifest: null, errors: [marketMsg('market.manifest.provenanceUnknownFields', { fields: pUf.join(', ') })] };
+    }
+    const source = pObj['source'];
+    const note = pObj['note'];
+    if (source !== undefined && typeof source !== 'string') {
+      return { ok: false, manifest: null, errors: [marketMsg('market.manifest.provenanceSourceNotString')] };
+    }
+    if (note !== undefined && typeof note !== 'string') {
+      return { ok: false, manifest: null, errors: [marketMsg('market.manifest.provenanceNoteNotString')] };
+    }
+    provenance = {
+      ...(source !== undefined ? { source } : {}),
+      ...(note !== undefined ? { note } : {}),
+    };
+  }
+
+  // 可选字段的类型校验必须先于 errors 收敛判定：此前它们在返回对象字面量里调用，
+  // 而只有 errors 为空才会走到那里 → 非法类型（如 author: 123）被当成「字段不存在」静默接受。
+  // 顺序与 L1 的 parseMarketIndex 一致（先算值 → 收敛 errors → 再返回）。
+  const author = optString(obj, 'author', errors, '$');
+  const description = optString(obj, 'description', errors, '$');
+  const updatedAt = optString(obj, 'updatedAt', errors, '$');
+  const categories = optStringArray(obj, 'categories', errors, '$');
+
+  if (errors.length > 0) return { ok: false, manifest: null, errors };
+
+  return {
+    ok: true,
+    manifest: {
+      schemaVersion: MARKET_ITEM_SCHEMA_VERSION,
+      id,
+      name,
+      version,
+      author,
+      description,
+      updatedAt,
+      categories,
+      ...(mode !== undefined ? { mode } : {}),
+      sections: sections as SectionId[],
+      ...(provenance !== undefined ? { provenance } : {}),
+      checksums: { zip },
+    },
+    errors: [],
+  };
+}

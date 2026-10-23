@@ -1,0 +1,1979 @@
+/**
+ * m2 run-store 单测：模块级单例 store + sessionStorage 恢复。
+ *
+ * 覆盖（验收 m2-state / m2-refresh / m2-resume）：
+ *  - 敏感字段（password/passwordConfirm/secretInputs）绝不写入 sessionStorage
+ *    （序列化白名单剔除），刷新后自动清空；
+ *  - 非敏感状态序列化/反序列化往返（新实例 + 同存储 = 模拟刷新）；
+ *  - 损坏/版本不符数据回退默认并清除脏键；
+ *  - 控制器实例缓存（切 tab/关面板不重建）；
+ *  - ImportWizard 从持久化快照 rehydrate（含 decisions；secretInputs 不恢复）；
+ *  - ConflictCollector 由 plan + 持久化决策重建；
+ *  - confirm 阶段缺必填 secret → 退回 secrets 阶段要求重输；
+ *  - m2-resume：进行中 run 经 /runs + 轮询 /progress 重新订阅，完成后把
+ *    RunState.result 回填 store 与控制器；无活跃 run 时如实提示不可恢复；
+ *  - subscribe/notify 语义。
+ */
+import test from 'node:test'
+import assert from 'node:assert/strict'
+
+import {
+  RunStore, STATE_KEY, normalizeProfilesSlice, redactPersistedValue, toPersistedState, toProfilesStoreSlice,
+  toSyncStoreSlice,
+  type PersistedState, type ProfilesStoreSlice, type StoreStorage,
+} from './run-store.ts'
+import type { DshProfileCopyResult, DshProfileLaunchResult, DshProfileTemplate } from '../profiles/dsh-profile-shared.ts'
+import type { RunProgress } from './common/progress-view.ts'
+import { MAX_RUN_LOG_LINES, type RunState } from '../core/run-registry.ts'
+import type { RestoreReport } from '../core/restore.ts'
+import type { ImportDecisions, ImportPlan } from '../core/types.ts'
+import { REDACTED } from '../security/redaction.ts'
+import type { ConfigManagerApi } from './api.ts'
+import {
+  makeAnalysis, makeExportReport, makeImportResult, makeManifest, makePlan,
+  makePlanItem,
+} from '../ui/test-helpers.ts'
+import type { SyncConfirmItem, SyncStartResponse } from './sync/sync-api.ts'
+import { channelMapOf, defaultChannelSyncState } from './sync/sync-view.ts'
+import type { ChannelSyncState, SyncChannel } from './sync/sync-view.ts'
+import { SYNC_CHANNELS } from '../utils/shared-constants.ts'
+import type { MarketListItem, MarketDownloadResult } from '../market/types.ts'
+
+/* ------------------------------------------------------------- fixtures */
+
+const RUN_ID = '0123456789abcdef0123456789abcdef'
+
+function makeStorage(): { storage: StoreStorage; raw: () => string | null } {
+  let value: string | null = null
+  return {
+    storage: {
+      getItem: (key: string) => (key === STATE_KEY ? value : null),
+      setItem: (key: string, v: string) => {
+        if (key === STATE_KEY) value = v
+      },
+      removeItem: (key: string) => {
+        if (key === STATE_KEY) value = null
+      },
+    },
+    raw: () => value,
+  }
+}
+
+function makeApi(overrides: Partial<ConfigManagerApi> = {}): ConfigManagerApi {
+  const base = {
+    exportPassword: null,
+    status: async () => { throw new Error('not implemented') },
+    export: async () => { throw new Error('not implemented') },
+    download: async () => { throw new Error('not implemented') },
+    upload: async () => { throw new Error('not implemented') },
+    analyzeImport: async () => { throw new Error('not implemented') },
+    createImportPlan: async () => { throw new Error('not implemented') },
+    executeImportPlan: async () => { throw new Error('not implemented') },
+    progress: async () => { throw new Error('not implemented') },
+    runs: async () => [] as RunState[],
+  }
+  return { ...base, ...overrides } as ConfigManagerApi
+}
+
+function runningRun(kind: RunState['kind'], patch: Partial<RunState> = {}): RunState {
+  return {
+    runId: RUN_ID,
+    kind,
+    status: 'running',
+    section: null,
+    sectionTotal: null,
+    item: null,
+    itemTotal: null,
+    detail: null,
+    log: [],
+    createdAt: 1,
+    updatedAt: 2,
+    ...patch,
+  }
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolvePromise) => setTimeout(resolvePromise, ms))
+
+/** waitFor 的轮询步长（ms）；只用于条件轮询，不用于「等待一段时间」。 */
+const WAIT_POLL_STEP_MS = 5
+
+/**
+ * 轮询等待条件成立（消除固定 sleep 竞态）；超时仍未成立则抛错，断言语义不变。
+ */
+async function waitFor(predicate: () => boolean, timeoutMs = 2000, label = '条件'): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    if (predicate()) return
+    if (Date.now() >= deadline) throw new Error(`waitFor 超时（${timeoutMs}ms）：${label} 仍未成立`)
+    await sleep(WAIT_POLL_STEP_MS)
+  }
+}
+
+/* ---------------------------------------------------------- 序列化白名单 */
+
+test('m2-refresh: password/passwordConfirm/secretInputs 绝不写入 sessionStorage', () => {
+  const { storage, raw } = makeStorage()
+  const store = new RunStore({ storage })
+  store.patch({
+    export: { password: 'S3CRET!', passwordConfirm: 'S3CRET!', includeSecrets: true },
+    import: { secretInputs: { K1: 'TOP-SECRET-VALUE' } },
+  })
+  const text = raw()
+  assert.ok(text !== null, 'patch 后已同步持久化')
+  assert.ok(!text.includes('S3CRET!'), '密码值不得落入 sessionStorage')
+  assert.ok(!text.includes('TOP-SECRET-VALUE'), '秘密补录值不得落入 sessionStorage')
+  const parsed = JSON.parse(text) as Record<string, unknown>
+  assert.ok(!('password' in (parsed['export'] as Record<string, unknown>)))
+  assert.ok(!('passwordConfirm' in (parsed['export'] as Record<string, unknown>)))
+  assert.ok(!('secretInputs' in (parsed['import'] as Record<string, unknown>)))
+})
+
+test('m2-refresh: skipRequested 为内存瞬态——不写入 sessionStorage、刷新后复位', () => {
+  const { storage, raw } = makeStorage()
+  const first = new RunStore({ storage })
+  first.patch({ import: { skipRequested: true, running: true } })
+  const text = raw()
+  assert.ok(text !== null)
+  const parsed = JSON.parse(text) as Record<string, unknown>
+  const imp = parsed['import'] as Record<string, unknown>
+  assert.ok(!('skipRequested' in imp), 'skipRequested 为瞬态，不得落盘')
+  // 新实例（模拟刷新）：skipRequested 复位为 false
+  const second = new RunStore({ storage })
+  assert.equal(second.getSnapshot().import.skipRequested, false, '刷新后跳过标记复位')
+})
+
+test('m2-refresh: 非敏感表单状态往返恢复，敏感字段与导出结果瞬态刷新后清空', () => {
+  const { storage } = makeStorage()
+  const first = new RunStore({ storage })
+  first.patch({
+    export: {
+      selection: ['settings', 'plugins'],
+      includeSecrets: true,
+      encrypt: true,
+      downloaded: true,
+      password: 'pw123',
+      passwordConfirm: 'pw123',
+    },
+    import: {
+      step: 'preview',
+      phase: 'secrets',
+      zipPath: '/tmp/x.zip',
+      analysis: makeAnalysis(),
+      plan: makePlan(),
+      secretInputs: { K1: 'in-memory-only' },
+    },
+  })
+
+  // 新实例 + 同一存储 = 模拟页面刷新
+  const second = new RunStore({ storage })
+  const st = second.getSnapshot()
+  assert.deepEqual(st.export.selection, ['settings', 'plugins'])
+  assert.equal(st.export.includeSecrets, true)
+  assert.equal(st.export.encrypt, true, 'encrypt 为非敏感选项，刷新后恢复')
+  assert.equal(st.export.downloaded, false, '导出完成提示（downloaded）为瞬态，刷新后清空')
+  assert.equal(st.export.password, '', '密码刷新后清空')
+  assert.equal(st.export.passwordConfirm, '', '确认密码刷新后清空')
+  assert.equal(st.import.step, 'preview')
+  assert.equal(st.import.phase, 'secrets')
+  assert.deepEqual(st.import.analysis, makeAnalysis())
+  assert.deepEqual(st.import.plan, makePlan())
+  assert.deepEqual(st.import.secretInputs, {}, '秘密补录值刷新后清空')
+})
+
+test('m2-refresh: 导出结果/进度/进行中为内存切片瞬态——不写入 sessionStorage、刷新后清空', () => {
+  const { storage, raw } = makeStorage()
+  const store = new RunStore({ storage })
+  store.patch({
+    export: {
+      result: {
+        zipPath: 'export-result-x.zip',
+        manifest: makeManifest(),
+        report: makeExportReport(),
+        text: '备份已创建\n已包含：\n  ✓ settings (21 namespaces)',
+      },
+      downloaded: true,
+      running: true,
+      progress: { stage: 'exporting', step: 1, total: 3, section: 'settings', item: 1, itemTotal: 3 },
+      runId: RUN_ID,
+    },
+  })
+  const text = raw()
+  assert.ok(text !== null, 'patch 后已同步持久化')
+  assert.ok(!text.includes('export-result-x.zip'), '导出结果文件名不得落入 sessionStorage')
+  assert.ok(!text.includes('备份已创建'), '报告文本不得落入 sessionStorage')
+  const parsed = JSON.parse(text) as { export: Record<string, unknown> }
+  assert.ok(!('result' in parsed['export']), 'export 切片不含 result（瞬态不落盘）')
+  assert.ok(!('downloaded' in parsed['export']), 'export 切片不含 downloaded（瞬态不落盘）')
+  assert.ok(!('running' in parsed['export']), 'export 切片不含 running（瞬态不落盘）')
+  assert.ok(!('progress' in parsed['export']), 'export 切片不含 progress（瞬态不落盘）')
+  assert.ok(!('runId' in parsed['export']), 'export 切片不含 runId（瞬态不落盘）')
+
+  // 新实例 + 同一存储 = 模拟页面刷新 → 导出结果清空，回到干净导出页
+  const second = new RunStore({ storage })
+  const st = second.getSnapshot()
+  assert.equal(st.export.result, null, '导出报告刷新后清空（不残留展示）')
+  assert.equal(st.export.downloaded, false, '已保存提示刷新后清空')
+  assert.equal(st.export.running, false, '进行中为瞬态，刷新后回复空闲')
+  assert.equal(st.export.progress, null, '进度刷新后清空')
+  assert.equal(st.export.runId, null, 'runId 刷新后清空')
+})
+
+test('损坏或版本不符的存储数据回退默认并清除脏键', () => {
+  const { raw } = makeStorage()
+  raw() // no-op to satisfy lint-like usage
+  // 非 JSON
+  let s = makeStorage()
+  let store = new RunStore({ storage: s.storage })
+  store.patch({ panel: 'library' })
+  s = makeStorage()
+  store = new RunStore({ storage: s.storage })
+  assert.equal(store.getSnapshot().panel, 'home')
+  // 损坏 JSON
+  const c1 = makeStorage()
+  c1.storage.setItem(STATE_KEY, '{not-json')
+  const corrupt = new RunStore({ storage: c1.storage })
+  assert.ok(corrupt.getSnapshot().export.selection.includes('settings'), '损坏数据被清除 → 回到默认（推荐分区）')
+  assert.equal(c1.raw(), null, '损坏数据被清除')
+  // 版本不符
+  const c2 = makeStorage()
+  c2.storage.setItem(STATE_KEY, JSON.stringify({ v: 999 }))
+  const wrongVersion = new RunStore({ storage: c2.storage })
+  assert.ok(wrongVersion.getSnapshot().export.selection.includes('settings'))
+  assert.equal(c2.raw(), null)
+})
+
+/* --------------------------------------------------------- 控制器实例缓存 */
+
+test('m2-state: 控制器实例由 store 缓存复用（不重建）', () => {
+  const api = makeApi()
+  const store = new RunStore({ storage: null })
+  assert.equal(store.exportFlow(api), store.exportFlow(api))
+  assert.equal(store.importWizard(api), store.importWizard(api))
+  // 不同 api 引用不换实例（模块内 api 是单例）
+  const otherApi = makeApi()
+  assert.equal(store.exportFlow(otherApi), store.exportFlow(api))
+})
+
+/* ------------------------------------------------------- wizard rehydrate */
+
+test('m2-refresh: ImportWizard 从持久化快照 rehydrate（decisions 恢复，secretInputs 不恢复）', async () => {
+  const plan = makePlan()
+  const analysis = makeAnalysis()
+  const { storage } = makeStorage()
+  const first = new RunStore({ storage })
+  first.patch({
+    import: {
+      step: 'preview',
+      phase: 'path-mapping',
+      zipPath: '/tmp/x.zip',
+      analysis,
+      plan,
+      rollbackOnError: false,
+      conflictResolutions: { 'settings:a': 'useImported' },
+      pathMappings: [{ oldPrefix: '/old', newPrefix: '/new', appliesTo: ['workspaces'] }],
+      errors: ['prev-error'],
+      secretInputs: { K1: 'never-persisted' },
+    },
+  })
+
+  const second = new RunStore({ storage })
+  const decisionsSeen: ImportDecisions[] = []
+  const api = makeApi({
+    analyzeImport: async () => analysis,
+    createImportPlan: async (_zip: string, decisions: ImportDecisions) => {
+      decisionsSeen.push(decisions)
+      return plan
+    },
+  })
+  const wizard = second.importWizard(api)
+  const snap = wizard.snapshot()
+  assert.equal(snap.step, 'preview')
+  assert.equal(snap.zipPath, '/tmp/x.zip')
+  assert.deepEqual(snap.analysis, analysis)
+  assert.deepEqual(snap.plan, plan)
+  assert.equal(snap.rollbackOnError, false)
+  assert.deepEqual(snap.errors, ['prev-error'])
+  assert.equal(second.getSnapshot().import.phase, 'path-mapping')
+
+  // decisions 恢复验证：confirmCompatibility 会用恢复的 decisions 重建计划
+  await wizard.confirmCompatibility()
+  assert.equal(decisionsSeen.length, 1)
+  assert.equal(decisionsSeen[0]!.strategy, 'merge')
+  assert.deepEqual(decisionsSeen[0]!.resolutions, { 'settings:a': 'useImported' })
+  assert.deepEqual(decisionsSeen[0]!.pathMappings, [
+    { oldPrefix: '/old', newPrefix: '/new', appliesTo: ['workspaces'] },
+  ])
+  // secretInputs 不暴露于 snapshot，但 execute 时会以空补录值执行（刷新后要求重输）
+})
+
+test('m2-refresh: conflicts 阶段刷新后 ConflictCollector 由 plan + 决策重建', () => {
+  const plan = makePlan({
+    items: [makePlanItem({ id: 'conf:1', kind: 'Conflict', description: '冲突项' })],
+  })
+  const { storage } = makeStorage()
+  const first = new RunStore({ storage })
+  first.patch({
+    import: { step: 'preview', phase: 'conflicts', plan, conflictResolutions: { 'conf:1': 'keepCurrent' } },
+  })
+  const second = new RunStore({ storage })
+  const collector = second.getSnapshot().import.conflictCollector
+  assert.ok(collector !== null, '刷新后 collector 重建')
+  assert.deepEqual(collector!.toResolutions(), { 'conf:1': 'keepCurrent' })
+  assert.equal(collector!.hasUnresolved, false)
+})
+
+test('m2-refresh: confirm 阶段仍缺必填 secret → 强制退回 secrets 阶段重输', () => {
+  const plan = makePlan() // makePlan 自带 missingSecrets: [{ ref: 'K1', required: true }]
+  const { storage } = makeStorage()
+  const first = new RunStore({ storage })
+  first.patch({ import: { step: 'preview', phase: 'confirm', plan } })
+  const second = new RunStore({ storage })
+  assert.equal(second.getSnapshot().import.phase, 'secrets')
+})
+
+/* ------------------------------------------------------- m2-resume 轮询恢复 */
+
+test('m2-resume: 进行中 import run 经 /runs + 轮询 /progress 重新订阅到完成', async () => {
+  const result = makeImportResult()
+  const progressResponses: RunState[] = [
+    runningRun('import', { section: 'plugins', item: 2, itemTotal: 5, detail: 'plugin:pkg-a' }),
+    {
+      runId: RUN_ID, kind: 'import', status: 'done',
+      section: null, sectionTotal: null, item: null, itemTotal: null, detail: null, log: [],
+      result, createdAt: 1, updatedAt: 3,
+    },
+  ]
+  let progressCalls = 0
+  const api = makeApi({
+    runs: async () => [runningRun('import')],
+    progress: async () => progressResponses[Math.min(progressCalls++, progressResponses.length - 1)]!,
+  })
+  const store = new RunStore({ storage: null, pollIntervalMs: 5 })
+  const wizard = store.importWizard(api)
+  const resumed = await store.resume(api)
+  assert.equal(resumed, true, '发现活跃 import run')
+  assert.equal(store.getSnapshot().import.step, 'importing', '恢复后立即进入 importing')
+
+  await waitFor(() => store.getSnapshot().import.step === 'result', 2000, '轮询收敛到 import result')
+  const imp = store.getSnapshot().import
+  assert.equal(imp.step, 'result')
+  assert.equal(imp.running, false)
+  assert.deepEqual(imp.result, result, 'RunState.result 回填 store')
+  assert.deepEqual(wizard.snapshot().result, result, '结果同步镜像回控制器')
+  assert.ok(progressCalls >= 2, '完成前至少轮询过一次 /progress')
+})
+
+test('m2-resume: 进行中 import run 恢复时带回执行日志（刷新页面 log 不丢）', async () => {
+  const initialLog = ['▶ settings:general', '$ dsh plugin --profile web add @scope/pkg', '✓ settings:general']
+  const progressResponses: RunState[] = [
+    runningRun('import', {
+      section: 'plugins', item: 3, itemTotal: 5, detail: 'plugin:@scope/pkg',
+      log: [...initialLog],
+    }),
+    runningRun('import', {
+      section: 'plugins', item: 4, itemTotal: 5, detail: 'plugin:@scope/pkg',
+      log: [...initialLog, '▶ plugin:@scope/pkg'],
+    }),
+    {
+      runId: RUN_ID, kind: 'import', status: 'done',
+      section: null, sectionTotal: null, item: null, itemTotal: null, detail: null, log: [],
+      result: makeImportResult(), createdAt: 1, updatedAt: 3,
+    },
+  ]
+  let progressCalls = 0
+  const api = makeApi({
+    // 刷新后 /runs 仍返回进行中 run（Host 侧导入继续执行），快照即带已累积日志
+    runs: async () => [runningRun('import', { log: [...initialLog] })],
+    progress: async () => progressResponses[Math.min(progressCalls++, progressResponses.length - 1)]!,
+  })
+  const store = new RunStore({ storage: null, pollIntervalMs: 5 })
+  // 订阅捕获轮询期间的进度快照（完成态 progress 不含 log，故在轮询中断言）
+  const seenLogs: (string[] | undefined)[] = []
+  const unsub = store.subscribe(() => {
+    const p = store.getSnapshot().import.progress
+    if (p !== null) seenLogs.push(p.log)
+  })
+  const resumed = await store.resume(api)
+  assert.equal(resumed, true, '发现活跃 import run')
+  assert.equal(store.getSnapshot().import.step, 'importing')
+  // 恢复瞬间：/runs 快照即带回已累积的日志行（刷新不丢）
+  assert.deepEqual(store.getSnapshot().import.progress?.log, initialLog, '刷新后立即恢复已累积日志')
+  // 轮询 /progress：日志持续追加
+  await waitFor(
+    () => seenLogs.some((l) => (l ?? []).includes('▶ plugin:@scope/pkg'))
+      && store.getSnapshot().import.step === 'result',
+    2000,
+    '轮询带回新增日志行并收敛到 result',
+  )
+  unsub()
+  assert.ok(
+    seenLogs.some((l) => (l ?? []).includes('▶ plugin:@scope/pkg')),
+    '轮询带回新增日志行',
+  )
+  assert.equal(store.getSnapshot().import.step, 'result')
+})
+
+test('m2-resume: 进行中 export run 轮询到完成，导出结果（含报告文本）恢复', async () => {
+  const report = makeExportReport()
+  const manifest = makeManifest()
+  const progressResponses: RunState[] = [
+    runningRun('export', { section: 'settings', item: 1, itemTotal: 3, detail: 'settings' }),
+    {
+      runId: RUN_ID, kind: 'export', status: 'done',
+      section: null, sectionTotal: null, item: null, itemTotal: null, detail: null, log: [],
+      result: { zipPath: 'dsh-config-x.zip', manifest, report },
+      createdAt: 1, updatedAt: 3,
+    },
+  ]
+  let progressCalls = 0
+  const api = makeApi({
+    runs: async () => [runningRun('export')],
+    progress: async () => progressResponses[Math.min(progressCalls++, progressResponses.length - 1)]!,
+  })
+  const store = new RunStore({ storage: null, pollIntervalMs: 5 })
+  const resumed = await store.resume(api)
+  assert.equal(resumed, true)
+
+  await waitFor(() => store.getSnapshot().export.result?.zipPath === 'dsh-config-x.zip', 2000, '轮询收敛到 export 完成并回填结果')
+  const exp = store.getSnapshot().export
+  assert.equal(exp.running, false)
+  assert.equal(exp.result?.zipPath, 'dsh-config-x.zip')
+  assert.deepEqual(exp.result?.manifest, manifest)
+  assert.equal(typeof exp.result?.text, 'string')
+  assert.ok((exp.result?.text ?? '').length > 0, '报告文本已渲染')
+})
+
+test('m2-resume: 持久化 importing 但 host 无活跃 run → 重置并提示不可恢复', async () => {
+  const { storage } = makeStorage()
+  const first = new RunStore({ storage })
+  first.patch({ import: { step: 'importing', runId: RUN_ID, running: true } })
+  const second = new RunStore({ storage })
+  const api = makeApi({ runs: async () => [] })
+  const resumed = await second.resume(api)
+  assert.equal(resumed, false)
+  const imp = second.getSnapshot().import
+  assert.equal(imp.step, 'select')
+  assert.equal(imp.running, false)
+  assert.ok((imp.error ?? '').includes('无法恢复'), '如实提示任务结果不可恢复')
+  // 控制器同样被重置
+  assert.equal(second.importWizard(api).snapshot().step, 'select')
+})
+
+test('m2-resume: run 404（过保留期）→ 停止轮询并提示不可恢复', async () => {
+  const api = makeApi({
+    runs: async () => [runningRun('export')],
+    progress: async () => { throw new Error('run not found') },
+  })
+  const store = new RunStore({ storage: null, pollIntervalMs: 5 })
+  await store.resume(api)
+  await waitFor(() => store.getSnapshot().export.error !== null, 2000, '404 后停止轮询并回填错误')
+  const exp = store.getSnapshot().export
+  assert.equal(exp.running, false)
+  assert.ok((exp.error ?? '').includes('保留期'), '提示保留期/不可恢复')
+})
+
+test('m2-resume: 导出失败 run → 停止轮询并回填错误', async () => {
+  const progressResponses: RunState[] = [
+    runningRun('export'),
+    {
+      runId: RUN_ID, kind: 'export', status: 'failed',
+      section: null, sectionTotal: null, item: null, itemTotal: null, detail: null, log: [],
+      error: '导出超时', createdAt: 1, updatedAt: 3,
+    },
+  ]
+  let progressCalls = 0
+  const api = makeApi({
+    runs: async () => [runningRun('export')],
+    progress: async () => progressResponses[Math.min(progressCalls++, progressResponses.length - 1)]!,
+  })
+  const store = new RunStore({ storage: null, pollIntervalMs: 5 })
+  await store.resume(api)
+  await waitFor(() => store.getSnapshot().export.error === '导出超时', 2000, '导出失败 run 回填错误')
+  const exp = store.getSnapshot().export
+  assert.equal(exp.running, false)
+  assert.equal(exp.error, '导出超时')
+  assert.equal(exp.result, null)
+})
+
+/* ------------------------------------------------- m3：本次会话内实时轮询 */
+
+test('m3-poll: watchRunning 经 /runs 发现进行中 run 并轮询 /progress 回填真实进度', async () => {
+  const result = makeImportResult()
+  const progressResponses: RunState[] = [
+    runningRun('import', { section: 'plugins', item: 6, itemTotal: 18, detail: 'plugin:pkg-a' }),
+    {
+      runId: RUN_ID, kind: 'import', status: 'done',
+      section: null, sectionTotal: null, item: null, itemTotal: null, detail: null, log: [],
+      result, createdAt: 1, updatedAt: 3,
+    },
+  ]
+  // 首次 /runs 尚无 run（请求刚发出，宿主尚未注册）→ 第二次才出现
+  let runsCalls = 0
+  let progressCalls = 0
+  const api = makeApi({
+    runs: async () => {
+      runsCalls += 1
+      return runsCalls === 1 ? [] : [runningRun('import')]
+    },
+    progress: async () => progressResponses[Math.min(progressCalls++, progressResponses.length - 1)]!,
+  })
+  const store = new RunStore({ storage: null, pollIntervalMs: 5 })
+  store.importWizard(api)
+  store.watchRunning('import', 5)
+
+  await waitFor(() => store.getSnapshot().import.step === 'result', 2000, 'watchRunning 发现 run 并轮询到完成')
+  const imp = store.getSnapshot().import
+  assert.ok(runsCalls >= 2, '发现阶段持续轮询 /runs 直到出现活跃 run')
+  assert.equal(imp.step, 'result', '完成后结果落账')
+  assert.deepEqual(imp.result, result)
+  // 发现后转入 /progress 轮询且回填过真实进度（内部计数 + 当前项名）
+  assert.ok(progressCalls >= 2, '发现 runId 后轮询 /progress')
+  assert.equal(imp.running, false)
+  // 发现活跃 run 时 runId 同步写入 store（fresh run 期间「跳过当前插件」有正确目标，
+  // 不会用上一次导入的陈旧 runId —— run-store patchProgress 同步 runId）
+  assert.equal(imp.runId, RUN_ID, 'watchRunning 发现 run 后 store.runId 立即填充')
+})
+
+test('m3-poll: watchRunning 轮询回填分区/内部计数进度（ProgressBar 徽章数据源）', async () => {
+  const progressResponses: RunState[] = [
+    runningRun('export', { section: 'settings', sectionTotal: 12, item: 3, itemTotal: 12, detail: 'settings' }),
+    runningRun('export', { section: 'plugins', sectionTotal: 12, item: 4, itemTotal: 12, detail: 'plugins' }),
+    {
+      runId: RUN_ID, kind: 'export', status: 'done',
+      section: null, sectionTotal: null, item: null, itemTotal: null, detail: null, log: [],
+      result: { zipPath: 'x.zip', manifest: makeManifest(), report: makeExportReport() },
+      createdAt: 1, updatedAt: 3,
+    },
+  ]
+  let progressCalls = 0
+  const api = makeApi({
+    runs: async () => [runningRun('export')],
+    progress: async () => progressResponses[Math.min(progressCalls++, progressResponses.length - 1)]!,
+  })
+  const store = new RunStore({ storage: null, pollIntervalMs: 5 })
+  store.exportFlow(api)
+  const seen: RunProgress[] = []
+  const unsub = store.subscribe(() => {
+    const p = store.getSnapshot().export.progress
+    if (p !== null) seen.push(p)
+  })
+  store.watchRunning('export', 5)
+
+  await waitFor(
+    () => seen.some((p) => p.section === 'plugins' && p.item === 4)
+      && store.getSnapshot().export.result?.zipPath === 'x.zip',
+    2000,
+    '轮询回填分区进度并收敛到完成',
+  )
+  unsub()
+  assert.ok(
+    seen.some((p) => p.section === 'settings' && p.item === 3 && p.itemTotal === 12),
+    '轮询回填分区进度 settings · 3/12',
+  )
+  assert.ok(seen.some((p) => p.section === 'plugins' && p.item === 4), '进度推进到下一分区 4/12')
+  assert.equal(store.getSnapshot().export.result?.zipPath, 'x.zip', '完成后结果落账')
+})
+
+test('m3-poll: stopRunWatch 停止发现阶段轮询（视图请求结束后）', async () => {
+  let runsCalls = 0
+  const api = makeApi({
+    runs: async () => {
+      runsCalls += 1
+      return [] // 永不出现 run（如请求未注册）
+    },
+  })
+  const store = new RunStore({ storage: null, pollIntervalMs: 5 })
+  store.exportFlow(api)
+  store.watchRunning('export', 5)
+  await waitFor(() => runsCalls >= 1, 2000, '发现阶段轮询已启动')
+  const callsBeforeStop = runsCalls
+  assert.ok(callsBeforeStop >= 1, '停止前发现阶段在轮询')
+  store.stopRunWatch('export')
+  const callsAfterStop = runsCalls
+  // 负向断言（stop 后不得再有 /runs 调用）无法用 waitFor 表达：必须保留一段观察
+  // 窗口，遗留定时器若仍在轮询，只能在这段窗口内被观察到。
+  await sleep(40)
+  assert.equal(runsCalls, callsAfterStop, 'stop 后不再轮询 /runs')
+  // 同一 kind 可再次 watch（新请求）
+  store.watchRunning('export', 5)
+  await waitFor(() => runsCalls > callsAfterStop, 2000, 'stop 后重新 watch 恢复轮询')
+  assert.ok(runsCalls > callsAfterStop, 'stop 后可重新 watch')
+  store.stopRunWatch('export')
+})
+
+test('m3-poll: 导入日志超过 MAX_RUN_LOG_LINES 后 store progress.log 仍持续更新（P1-3 封顶不冻结）', async () => {
+  // 模拟导入日志已满 500 行封顶：后续轮询长度恒为 500，但每次 append 都换新数组引用
+  // （run-registry appendLog 不可变写入）。store 的 progress.log 必须持续拿到新引用，
+  // 否则 ImportLogPanel 的 memo 按引用比较会判定「无变化」→ 日志面板冻结。
+  let log: string[] = []
+  for (let i = 0; i < MAX_RUN_LOG_LINES; i++) log = [...log, `line-${i}`]
+  const progressResponses: RunState[] = []
+  for (let i = 0; i < 4; i++) {
+    log = [...log.slice(-(MAX_RUN_LOG_LINES - 1)), `cap-${i}`]
+    progressResponses.push(runningRun('import', { section: 'plugins', item: i + 1, itemTotal: 8, detail: 'plugin:pkg', log }))
+  }
+  progressResponses.push({
+    runId: RUN_ID, kind: 'import', status: 'done',
+    section: null, sectionTotal: null, item: null, itemTotal: null, detail: null, log: [],
+    result: makeImportResult(), createdAt: 1, updatedAt: 3,
+  })
+  let progressCalls = 0
+  const api = makeApi({
+    runs: async () => [runningRun('import')],
+    progress: async () => progressResponses[Math.min(progressCalls++, progressResponses.length - 1)]!,
+  })
+  const store = new RunStore({ storage: null, pollIntervalMs: 5 })
+  await store.resume(api)
+  // 订阅捕获轮询期间的 progress.log 引用
+  const seenRefs = new Set<string[]>()
+  const seenTails = new Set<string>()
+  const unsub = store.subscribe(() => {
+    const p = store.getSnapshot().import.progress
+    const log = p?.log ?? []
+    if (log.length === MAX_RUN_LOG_LINES) {
+      seenRefs.add(log)
+      seenTails.add(log[log.length - 1]!)
+    }
+  })
+  await waitFor(
+    () => store.getSnapshot().import.step === 'result' && seenTails.has('cap-3'),
+    2000,
+    '封顶日志持续更新并收敛到完成',
+  )
+  unsub()
+  assert.equal(store.getSnapshot().import.step, 'result', '轮询收敛到完成')
+  assert.ok(seenRefs.size >= 3, `封顶后轮询仍拿到新数组引用（实际 ${seenRefs.size} 个不同引用）`)
+  assert.ok(seenTails.has('cap-3'), '最新行 cap-3 已到达 store（日志没有冻结在旧行）')
+  assert.ok(!seenTails.has('line-499'), '截断保留最新行（cap-* 覆盖 line-* 尾部）')
+})
+
+test('m3-poll: 同一 kind 重复 watchRunning 不重复启动', async () => {
+  let runsCalls = 0
+  const api = makeApi({
+    runs: async () => {
+      runsCalls += 1
+      return []
+    },
+  })
+  const store = new RunStore({ storage: null, pollIntervalMs: 5 })
+  store.exportFlow(api)
+  store.watchRunning('export', 5)
+  store.watchRunning('export', 5) // 幂等：不另起发现循环
+  await waitFor(() => runsCalls >= 1, 2000, '发现阶段轮询已启动')
+  store.stopRunWatch('export')
+  const calls = runsCalls
+  // 同上：负向断言需要一段观察窗口（stop 后不得有遗留轮询）。
+  await sleep(30)
+  assert.equal(runsCalls, calls, 'stop 后无遗留轮询')
+})
+
+/* ------------------------------------------------------------- 订阅语义 */
+
+test('subscribe/notify: patch 触发监听器，退订后不再通知', () => {
+  const store = new RunStore({ storage: null })
+  let notified = 0
+  const unsub = store.subscribe(() => { notified += 1 })
+  store.patch({ panel: 'library' })
+  assert.equal(notified, 1)
+  unsub()
+  store.patch({ panel: 'home' })
+  assert.equal(notified, 1)
+  // getSnapshot 引用在 patch 后替换（useSyncExternalStore 要求）
+  const before = store.getSnapshot()
+  store.patch({ panel: 'library' })
+  assert.notEqual(store.getSnapshot(), before)
+})
+
+test('回归: subscribe/getSnapshot 以裸引用调用时 this 绑定实例（useSyncExternalStore 的调用方式）', () => {
+  const store = new RunStore({ storage: null })
+  // React 内部以无接收者方式调用 getSnapshot()/subscribe(listener) ——
+  // 若为原型方法则 this 为 undefined 直接崩溃（备份与迁移页空白根因）。
+  const bareGet = store.getSnapshot
+  const bareSub = store.subscribe
+  assert.equal(bareGet().panel, 'home', '裸引用 getSnapshot 不崩（this 绑定实例）')
+  let notified = 0
+  const unsub = bareSub(() => { notified += 1 })
+  store.patch({ panel: 'library' })
+  assert.equal(notified, 1, '裸引用 subscribe 不崩且能退订')
+  unsub()
+  store.patch({ panel: 'home' })
+  assert.equal(notified, 1, '退订后不再通知')
+})
+
+/* ----------------------------------------- 低频面板切片持久化（切 tab / 刷新恢复） */
+
+/** SyncConfirmItem 最小夹具。 */
+function makeConfirmItem(id: string): SyncConfirmItem {
+  return {
+    itemId: id,
+    adapter: 'settings',
+    kind: 'Update',
+    description: `更新 ${id}`,
+    severity: 'info',
+    defaultAdopt: true,
+    adopt: true,
+  }
+}
+
+/** 一键同步差异确认会话夹具（items 非敏感，可安全持久化）。 */
+function makeConfirmSession(): SyncStartResponse {
+  return {
+    ok: true,
+    syncSessionId: 'sync-session-test-0001',
+    snapshotId: 'snap-abc',
+    items: [makeConfirmItem('settings:key'), makeConfirmItem('plugins:pkg')],
+    needsReview: false,
+    compatibility: 'excellent',
+  }
+}
+
+/**
+ * 同步切片夹具的返回类型。
+ *
+ * `RunStore.patch` 的参数是 DeepPartial，直接用它会让 `patch.byChannel` 变成可选
+ * （新用例要**就地覆写**某条通道的字段，需要它必然存在）。这里显式要求 byChannel 齐全，
+ * 其余字段保持可选（与既有夹具一致）。
+ */
+type SyncPatchFixture = Omit<NonNullable<Parameters<RunStore['patch']>[0]['sync']>, 'byChannel'> & {
+  byChannel: Record<SyncChannel, ChannelSyncState>
+}
+
+/** 同步切片夹具（含敏感字段；token/webdav/加密与解密密码必须被白名单剔除）。 */
+function makeSyncPatch(): SyncPatchFixture {
+  return {
+    channel: 'webdav',
+    repoUrl: 'https://github.com/u/repo.git',
+    token: 'GIT-TOKEN-SECRET',
+    webdavUrl: 'https://dav.example.com/dav',
+    webdavUsername: 'alice',
+    webdavPassword: 'WEBDAV-PASS-SECRET',
+    // 瞬态：进行中推送 + 保存中 —— 切 tab 由模块级单例保留，刷新时白名单剔除
+    busy: 'push',
+    savingConfig: true,
+    // 键集合由枚举构造（与 run-store 的实现同源）：加通道时这里自动覆盖，
+    // 不再需要手写第二个 { git, webdav } 字面量。只覆写本用例要断言的差异值。
+    byChannel: {
+      ...channelMapOf(() => defaultChannelSyncState()),
+      git: {
+        ...defaultChannelSyncState(),
+        syncMode: 'default',
+        encryptPasswordSaved: true,
+        decryptPasswordSaved: true,
+      },
+      webdav: {
+        ...defaultChannelSyncState(),
+        syncMode: 'advanced',
+        syncSections: ['settings', 'plugins'],
+        encrypt: true,
+        includeSecrets: true,
+        encryptPassword: 'ENC-PASS-SECRET',
+        encryptPasswordConfirm: 'ENC-PASS-SECRET',
+        decryptPassword: 'DEC-PASS-SECRET',
+        selectedSnapshotId: 'snap-xyz',
+      },
+    },
+    pushReport: null,
+    pullReport: null,
+    confirmSession: makeConfirmSession(),
+    lastRestoreId: null,
+    error: 'sync error text',
+    loadError: null,
+  }
+}
+
+test('issue #60: patch 之后在途密码仍留在内存（否则无关回填会清空用户正在输入的密码）', () => {
+  const { storage, raw } = makeStorage()
+  const store = new RunStore({ storage })
+  // 用户在 webdav 密码框里输入
+  store.patchSyncPasswords({ webdavPassword: 'typed-by-user', token: 'typed-token' })
+  assert.equal(store.getSnapshot().sync.webdavPassword, 'typed-by-user')
+  assert.equal(store.getSnapshot().sync.token, 'typed-token')
+
+  // 一次**无关**的 patch（真机场景：远端快照列表到货 / GitHub 轮询结束）——
+  // 持久化白名单会把密码字段写成空串，随后必须由 patchSyncPasswords 写回内存
+  const slice = toSyncStoreSlice(store.getSnapshot().sync)
+  store.patch({ sync: { ...slice, webdavPassword: '', token: '' } })
+  store.patchSyncPasswords({ webdavPassword: 'typed-by-user', token: 'typed-token' })
+  const after = store.getSnapshot().sync
+  assert.equal(after.webdavPassword, 'typed-by-user', '在途 webdav 密码不得被无关 patch 清空')
+  assert.equal(after.token, 'typed-token', '在途 git token 不得被无关 patch 清空')
+
+  // 仍然绝不落盘（本轮修复不得放宽安全不变量）
+  const persisted = raw()
+  assert.ok(persisted !== null, 'patch 后已同步持久化')
+  assert.ok(!persisted.includes('typed-by-user'), 'webdav 密码绝不进 sessionStorage')
+  assert.ok(!persisted.includes('typed-token'), 'git token 绝不进 sessionStorage')
+
+  // 未给出的字段保持不变（部分更新语义）
+  store.patchSyncPasswords({})
+  assert.equal(store.getSnapshot().sync.webdavPassword, 'typed-by-user')
+})
+
+test('低频面板: 同步凭据（token/webdav/加密与解密密码）绝不写入 sessionStorage', () => {
+  const { storage, raw } = makeStorage()
+  const store = new RunStore({ storage })
+  store.patch({ sync: makeSyncPatch() })
+  const text = raw()
+  assert.ok(text !== null, 'patch 后已同步持久化')
+  assert.ok(!text.includes('GIT-TOKEN-SECRET'), 'git token 不得落入 sessionStorage')
+  assert.ok(!text.includes('WEBDAV-PASS-SECRET'), 'webdav 密码不得落入 sessionStorage')
+  assert.ok(!text.includes('ENC-PASS-SECRET'), '加密密码不得落入 sessionStorage')
+  assert.ok(!text.includes('DEC-PASS-SECRET'), '解密密码不得落入 sessionStorage')
+  assert.ok(text.includes('https://github.com/u/repo.git'), '非敏感表单值可持久化')
+  assert.ok(text.includes('sync-session-test-0001'), '确认会话 id 可持久化（宿主侧 30 分钟内存登记）')
+  const parsed = JSON.parse(text) as {
+    sync: {
+      byChannel: { git: Record<string, unknown>; webdav: Record<string, unknown> }
+      [k: string]: unknown
+    }
+  }
+  assert.ok(!('token' in parsed['sync']), 'sync 切片不含 token')
+  assert.ok(!('webdavPassword' in parsed['sync']), 'sync 切片不含 webdav 密码')
+  assert.ok(!('busy' in parsed['sync']), 'sync 切片不含 busy（瞬态不落盘）')
+  assert.ok(!('savingConfig' in parsed['sync']), 'sync 切片不含 savingConfig（瞬态不落盘）')
+  assert.ok(!('encryptPassword' in parsed['sync']), 'sync 切片顶层不含加密密码')
+  assert.ok(!('encryptPasswordConfirm' in parsed['sync']), 'sync 切片顶层不含加密密码确认')
+  assert.ok(!('decryptPassword' in parsed['sync']), 'sync 切片顶层不含解密密码')
+  assert.ok(!('encryptPassword' in parsed['sync'].byChannel.git), 'byChannel.git 不含加密密码')
+  assert.ok(!('encryptPasswordConfirm' in parsed['sync'].byChannel.git), 'byChannel.git 不含加密密码确认')
+  assert.ok(!('decryptPassword' in parsed['sync'].byChannel.git), 'byChannel.git 不含解密密码')
+  assert.ok(!('encryptPassword' in parsed['sync'].byChannel.webdav), 'byChannel.webdav 不含加密密码')
+  assert.ok(!('decryptPassword' in parsed['sync'].byChannel.webdav), 'byChannel.webdav 不含解密密码')
+  assert.equal(parsed['sync'].byChannel.webdav.syncMode, 'advanced', '非敏感通道设置可持久化')
+  assert.deepEqual(parsed['sync'].byChannel.webdav.syncSections, ['settings', 'plugins'])
+})
+
+test('t17: byChannel 从 SYNC_CHANNELS 派生 —— s3/gist 的镜像可持久化并跨刷新往返', () => {
+  const { storage, raw } = makeStorage()
+  const first = new RunStore({ storage })
+  const patch = makeSyncPatch()
+  // 给两条云端点通道配上可断言的非敏感设置（密钥类**不在此切片**：见下一条用例的哨兵证明）
+  patch.byChannel.s3 = {
+    ...defaultChannelSyncState(),
+    syncMode: 'advanced',
+    syncSections: ['settings'],
+    sessionsLimit: 7,
+    selectedSnapshotId: 'snap-s3',
+  }
+  patch.byChannel.gist = {
+    ...defaultChannelSyncState(),
+    syncMode: 'advanced',
+    syncSections: ['skills'],
+    selectedSnapshotId: 'snap-gist',
+  }
+  first.patch({ panel: 'sync', sync: patch })
+
+  // ① 运行时切片键集合 == 枚举（不多不少）
+  assert.deepEqual(
+    Object.keys(first.getSnapshot().sync.byChannel).sort(),
+    [...SYNC_CHANNELS].sort(),
+    '运行时切片的通道键集合必须与 SYNC_CHANNELS 逐项一致',
+  )
+  // ② 持久化切片同样覆盖全部通道 —— 这一条正是 t12 报告的缺口（s3/gist 此前被整块丢掉）
+  const persisted = toPersistedState(first.getSnapshot())
+  assert.deepEqual(
+    Object.keys(persisted.sync.byChannel).sort(),
+    [...SYNC_CHANNELS].sort(),
+    '持久化切片的通道键集合也必须与 SYNC_CHANNELS 逐项一致',
+  )
+  // ③ 新通道的**非敏感**设置确实写进了 sessionStorage
+  const text = raw()
+  assert.ok(text !== null, 'patch 后已同步持久化')
+  assert.ok(text.includes('snap-s3'), 's3 通道的选中快照应进入 sessionStorage')
+  assert.ok(text.includes('snap-gist'), 'gist 通道的选中快照应进入 sessionStorage')
+
+  // ④ 跨刷新往返（新实例 + 同存储 = 模拟刷新）
+  const restored = new RunStore({ storage }).getSnapshot().sync.byChannel
+  assert.equal(restored.s3.selectedSnapshotId, 'snap-s3', 's3 通道的镜像刷新后恢复')
+  assert.equal(restored.s3.sessionsLimit, 7, 's3 通道的会话上限刷新后恢复')
+  assert.deepEqual(restored.s3.syncSections, ['settings'], 's3 通道的勾选刷新后恢复')
+  assert.equal(restored.gist.selectedSnapshotId, 'snap-gist', 'gist 通道的镜像刷新后恢复')
+  assert.deepEqual(restored.gist.syncSections, ['skills'], 'gist 通道的勾选刷新后恢复')
+})
+
+test('t17: 持久化产物经哨兵搜索证明不含任何密钥（含云端点密钥字段）', () => {
+  const { storage, raw } = makeStorage()
+  const store = new RunStore({ storage })
+  const patch = makeSyncPatch()
+  // ① 真实敏感字段全部注入哨兵值（git token / webdav 口令 / 加密与解密密码）
+  patch.token = 'SENTINEL-GIT-TOKEN-8f3a'
+  patch.webdavPassword = 'SENTINEL-WEBDAV-PASS-1c9d'
+  patch.byChannel.git.encryptPassword = 'SENTINEL-ENC-PASS-77bd'
+  patch.byChannel.git.encryptPasswordConfirm = 'SENTINEL-ENC-PASS-77bd'
+  patch.byChannel.webdav.decryptPassword = 'SENTINEL-DEC-PASS-4e21'
+
+  // ② 模拟「未来把云端点密钥放进切片」：**值与字段名**都注入（顶层 + byChannel.s3 各一份）。
+  //    放行清单之外的字段默认拒绝，所以它们既不该落盘、也不该出现在 toPersistedState() 里。
+  const S3_SECRET = 'SENTINEL-S3-SECRET-a5f0'
+  const GIST_TOKEN = 'SENTINEL-GIST-TOKEN-2b6c'
+  const ACCESS_KEY_ID = 'SENTINEL-ACCESSKEY-ID-93aa'
+  const snap = store.getSnapshot() as unknown as {
+    sync: Record<string, unknown> & { byChannel: Record<SyncChannel, Record<string, unknown>> }
+  }
+  snap.sync['s3Secret'] = S3_SECRET
+  snap.sync['gistToken'] = GIST_TOKEN
+  snap.sync['accessKeyId'] = ACCESS_KEY_ID
+  snap.sync.byChannel.s3['s3Secret'] = S3_SECRET
+  snap.sync.byChannel.s3['gistToken'] = GIST_TOKEN
+  snap.sync.byChannel.s3['accessKeyId'] = ACCESS_KEY_ID
+
+  store.patch({ sync: patch })
+  store.save()
+
+  // ③ 落盘字节 + toPersistedState() 的字节里都不得出现任何哨兵**值**
+  const text = raw()
+  assert.ok(text !== null, 'patch 后已同步持久化')
+  const persistedJson = JSON.stringify(toPersistedState(store.getSnapshot()))
+  const sentinels: [string, string][] = [
+    ['git token', 'SENTINEL-GIT-TOKEN-8f3a'],
+    ['webdav 口令', 'SENTINEL-WEBDAV-PASS-1c9d'],
+    ['加密密码', 'SENTINEL-ENC-PASS-77bd'],
+    ['解密密码', 'SENTINEL-DEC-PASS-4e21'],
+    ['s3 Secret', S3_SECRET],
+    ['gist token', GIST_TOKEN],
+    ['s3 accessKeyId', ACCESS_KEY_ID],
+  ]
+  for (const [label, value] of sentinels) {
+    assert.ok(!text.includes(value), label + ' 的值不得落入 sessionStorage')
+    assert.ok(!persistedJson.includes(value), label + ' 的值不得出现在 toPersistedState()')
+  }
+
+  // ④ 字段名同样不得出现（sync 顶层与每条通道的状态里都不允许）
+  const persisted = toPersistedState(store.getSnapshot())
+  const forbiddenNames = ['s3Secret', 'gistToken', 'accessKeyId', 'token', 'webdavPassword', 'encryptPassword', 'decryptPassword', 'encryptPasswordConfirm']
+  for (const key of forbiddenNames) {
+    assert.ok(!Object.keys(persisted.sync).includes(key), 'sync 顶层不得含字段 ' + key)
+  }
+  for (const ch of SYNC_CHANNELS) {
+    const keys = Object.keys(persisted.sync.byChannel[ch])
+    for (const key of forbiddenNames) {
+      assert.ok(!keys.includes(key), 'byChannel.' + ch + ' 不得含字段 ' + key)
+    }
+    // 兜底：名字里带 secret/password/token/accesskey 的字段一律不应出现（防未来新增漏放行）。
+    // 唯一豁免 = includeSecrets：它是「是否导出真实凭据值」的**开关**（布尔，本身不带值），
+    // 按设计就是要持久化的用户偏好（见 SyncChannelState 的注释）。
+    for (const key of keys) {
+      assert.ok(
+        key === 'includeSecrets' || !/secret|password|token|accesskey/i.test(key),
+        'byChannel.' + ch + ' 含可疑字段 ' + key,
+      )
+    }
+  }
+
+  // ⑤ 正向对照：同一通道的**非敏感**设置确实落盘（证明本用例不是空转）
+  assert.ok(persistedJson.includes('snap-xyz'), '非敏感通道设置仍照常持久化')
+})
+
+test('低频面板: 同步/市场/快照切片与当前面板刷新往返恢复（敏感字段清空）', () => {
+  const { storage } = makeStorage()
+  const first = new RunStore({ storage })
+  const confirmSession = makeConfirmSession()
+  const plan = makePlan()
+  const analysis = makeAnalysis()
+  first.patch({ panel: 'sync', sync: makeSyncPatch() })
+  const marketDetail: MarketDownloadResult = {
+    id: 'm1',
+    name: 'Market A',
+    version: '1.0.0',
+    sections: ['settings'],
+    downloadedAt: '2026-01-01T00:00:00Z',
+    status: 'valid',
+    warnings: ['第三方来源'],
+    zipPath: '/tmp/market-m1-abc.zip',
+    analysis,
+    plan,
+  }
+  first.patch({
+    panel: 'library',
+    market: {
+      search: 'deepseek',
+      category: 'sync',
+      items: [{ id: 'm1', name: 'Market A', cacheState: 'cached' } as MarketListItem],
+      detail: marketDetail,
+      selectionState: { zipPath: marketDetail.zipPath, selection: { sections: ['settings'], excluded: ['settings:x'] } },
+      conflictResolutions: { 'skills:bar': 'useImported' },
+      importResult: null,
+      error: 'market error',
+      loadError: null,
+    },
+  })
+  // UI v2：产物列表已从 snapshots 页搬去产物库（library 页）——旧 snapshots 面板现在
+  // 只承载「定时备份 / 事故恢复」两个子视图，所以「刷新后回到原面板」这条用例改成 library。
+  // 注意快照切片本身**照旧持久化**（它仍是非敏感界面状态），只是面板 id 换了。
+  first.patch({
+    panel: 'library',
+    snapshots: {
+      selectedId: 'snap-1',
+      plan: {
+        snapshotId: 'snap-1',
+        createdAt: '2026-01-01T00:00:00Z',
+        sourceZip: 'x.zip',
+        actions: [],
+        summary: { hostFileRestores: 0, hostFileRemoves: 0, pluginRemoves: 0, fileRestores: 0, fileRemoves: 0, credentialHints: 0, skips: 1 },
+        pluginBaselineConfirmed: true,
+      },
+      report: {
+        snapshotId: 'snap-1',
+        restored: ['settings.yaml'],
+        removedPlugins: [],
+        manualHints: [],
+        failed: [],
+        skipped: [],
+      },
+      actionError: null,
+      error: null,
+    },
+  })
+
+  // 新实例 + 同一存储 = 模拟页面刷新
+  const second = new RunStore({ storage })
+  const st = second.getSnapshot()
+  assert.equal(st.panel, 'library', '刷新后回到原低频面板')
+  assert.equal(st.sync.channel, 'webdav')
+  assert.equal(st.sync.byChannel.webdav.syncMode, 'advanced', 'webdav 通道模式恢复')
+  assert.deepEqual(st.sync.byChannel.webdav.syncSections, ['settings', 'plugins'], 'webdav 通道勾选恢复')
+  assert.equal(st.sync.byChannel.webdav.selectedSnapshotId, 'snap-xyz')
+  // 持久化切片按原样恢复（旧载荷里 git 是 'default'）；同步面板 loadStatus 会归一到
+  // advanced（勾选集合即同步范围），下次保存即以 advanced 落盘。
+  assert.equal(st.sync.byChannel.git.syncMode, 'default', 'git 通道独立（照原样恢复持久化值）')
+  assert.deepEqual(st.sync.confirmSession, confirmSession, '确认会话刷新后恢复（宿主侧会话仍有效）')
+  assert.equal(st.sync.error, 'sync error text')
+  assert.equal(st.sync.token, '', 'git token 刷新后清空')
+  assert.equal(st.sync.webdavPassword, '', 'webdav 密码刷新后清空')
+  assert.equal(st.sync.byChannel.webdav.encryptPassword, '', '加密密码刷新后清空')
+  assert.equal(st.sync.byChannel.webdav.decryptPassword, '', '解密密码刷新后清空')
+  assert.equal(st.sync.busy, null, '进行中操作（busy）为瞬态，刷新后清空回复空闲')
+  assert.equal(st.sync.savingConfig, false, '保存中（savingConfig）为瞬态，刷新后清空')
+  assert.equal(st.market.search, 'deepseek')
+  assert.equal(st.market.category, 'sync')
+  assert.equal(st.market.items.length, 1)
+  assert.deepEqual(st.market.detail, marketDetail, '详情（含 zipPath/plan）往返恢复')
+  assert.deepEqual(
+    st.market.selectionState,
+    { zipPath: '/tmp/market-m1-abc.zip', selection: { sections: ['settings'], excluded: ['settings:x'] } },
+    '条目级勾选（绑 zipPath）往返恢复',
+  )
+  assert.deepEqual(st.market.conflictResolutions, { 'skills:bar': 'useImported' }, '逐项冲突决策往返恢复')
+  assert.equal(st.market.error, 'market error')
+  assert.equal(st.snapshots.selectedId, 'snap-1')
+  assert.equal(st.snapshots.plan?.snapshotId, 'snap-1')
+  assert.deepEqual(st.snapshots.report?.restored, ['settings.yaml'])
+})
+
+test('低频面板: 旧版 v1 载荷（无 panel/sync/market/snapshots 字段）兼容解析 → 默认切片', () => {
+  const { storage } = makeStorage()
+  storage.setItem(STATE_KEY, JSON.stringify({
+    v: 1,
+    view: 'import',
+    export: {
+      mode: 'quick', selection: [], includeSecrets: false, encrypt: false,
+      running: false, progress: null, result: null, error: null, downloaded: false, runId: null,
+    },
+    import: {
+      step: 'select', zipPath: null, selectedFileName: null, containerEncrypted: false,
+      analysis: null, plan: null, result: null, rollbackOnError: true, errors: [],
+      phase: 'preview', conflictStrategy: 'merge', conflictResolutions: {}, pathMappings: [],
+      uploading: false, running: false, progress: null, error: null, runId: null,
+    },
+  }))
+  const store = new RunStore({ storage })
+  const st = store.getSnapshot()
+  assert.equal(st.panel, 'home', 'v3：旧载荷无 panel / view 字段 → 首页（view 字段已退役）')
+  assert.equal(st.sync.channel, 'git')
+  assert.equal(st.sync.byChannel.git.syncSections.length, 0)
+  assert.equal(st.sync.byChannel.webdav.syncMode, 'advanced', 'webdav 通道缺省（恒 advanced）')
+  assert.deepEqual(st.market.items, [])
+  assert.equal(st.snapshots.selectedId, null)
+})
+
+test('低频面板: 旧版顶层 syncMode 载荷 → 迁移为 git 通道的 byChannel 状态', () => {
+  const { storage } = makeStorage()
+  storage.setItem(STATE_KEY, JSON.stringify({
+    v: 1,
+    view: 'export',
+    export: {
+      mode: 'quick', selection: [], includeSecrets: false, encrypt: false,
+      running: false, progress: null, result: null, error: null, downloaded: false, runId: null,
+    },
+    import: {
+      step: 'select', zipPath: null, selectedFileName: null, containerEncrypted: false,
+      analysis: null, plan: null, result: null, rollbackOnError: true, errors: [],
+      phase: 'preview', conflictStrategy: 'merge', conflictResolutions: {}, pathMappings: [],
+      uploading: false, running: false, progress: null, error: null, runId: null,
+    },
+    sync: {
+      channel: 'git', repoUrl: '', token: '', webdavUrl: '', webdavUsername: '', webdavPassword: '',
+      syncMode: 'advanced', syncSections: ['settings'], encrypt: true, includeSecrets: false,
+      encryptPassword: 'SHOULD-NOT-PERSIST', encryptPasswordConfirm: '', decryptPassword: '',
+      selectedSnapshotId: 'snap-old', pushReport: null, pullReport: null, confirmSession: null,
+      lastRestoreId: null, error: null, loadError: null,
+    },
+  }))
+  const store = new RunStore({ storage })
+  const st = store.getSnapshot()
+  assert.equal(st.sync.byChannel.git.syncMode, 'advanced', '旧顶层模式迁移到 git 通道')
+  assert.deepEqual(st.sync.byChannel.git.syncSections, ['settings'], '旧顶层勾选迁移到 git 通道')
+  assert.equal(st.sync.byChannel.git.encrypt, true)
+  assert.equal(st.sync.byChannel.git.encryptPassword, '', '迁移后加密密码仍强制清空')
+  assert.equal(st.sync.byChannel.git.selectedSnapshotId, 'snap-old')
+  assert.equal(st.sync.byChannel.webdav.syncMode, 'advanced', 'webdav 通道保持缺省（恒 advanced）')
+})
+
+/* -------------------------------------------------- 聚合优化（2026-08）：一级 tab 8→6 的旧值迁移 */
+
+test('UI v3 迁移: 旧 panel "recovery" → 环境页 + 维护与诊断子视图', () => {
+  const { storage } = makeStorage()
+  storage.setItem(STATE_KEY, JSON.stringify({
+    v: 1, view: 'export', panel: 'recovery',
+    export: { mode: 'quick', selection: [], includeSecrets: false, encrypt: false, fileName: '', note: '', error: null },
+    import: { step: 'select', selectedFileName: null, containerEncrypted: false, error: null },
+    recovery: { status: { incidents: [], running: [] }, selectedOperationId: null, preview: null, verifyResult: null, running: false, error: null, actionError: null },
+    snapshots: { selectedId: null, plan: null, running: false, report: null, actionError: null, error: null, backupDraft: null, importBackup: null, subTab: 'restore' },
+  } as Record<string, unknown>))
+  const store = new RunStore({ storage })
+  const st = store.getSnapshot()
+  // v3：备份与快照页已解散 —— 事故恢复归「环境 → 维护与诊断」。
+  // 旧 recovery tab 是**急救入口**：落到环境页还不够，必须同时落到维护与诊断子视图，
+  // 否则用户看到的是档案列表（v2 只落到页面，等于把急救入口丢在半路）。
+  assert.equal(st.panel, 'environment', '旧 recovery tab → 环境页')
+  assert.equal(st.profiles.subView, 'maintenance', '并直达维护与诊断子视图')
+  assert.equal('subTab' in st.snapshots, false, 'v1 的 snapshots.subTab 字段已删除')
+})
+
+test('UI v3：旧 panel "about"/"history"/"more" → home；旧 more 载荷被忽略（面板是瞬态）', () => {
+  const { storage } = makeStorage()
+  const load = (panel: string, extra: Record<string, unknown> = {}): RunStore => {
+    storage.setItem(STATE_KEY, JSON.stringify({
+      v: 1, view: 'export', panel, ...extra,
+      export: { mode: 'quick', selection: [], includeSecrets: false, encrypt: false, fileName: '', note: '', error: null },
+      import: { step: 'select', selectedFileName: null, containerEncrypted: false, error: null },
+    }))
+    return new RunStore({ storage })
+  }
+
+  for (const panel of ['about', 'history', 'more']) {
+    assert.equal(load(panel).getSnapshot().panel, 'home', `旧 ${panel} tab → 首页`)
+  }
+
+  // v2：抽屉整体删除，活动/历史/关于变成 task 面板。**面板是否打开是瞬态** ——
+  // 旧载荷里的 `more: { moreSub }` 直接忽略，不恢复、也不报错。
+  const store = load('more', { more: { moreSub: 'history' } })
+  assert.equal(store.getSnapshot().task, null, '旧 more 载荷不得恢复出任何面板')
+  assert.equal('more' in store.getSnapshot(), false, 'more 切片已随抽屉废弃')
+})
+
+/* -------------------------------------------------- restore（P1-1）权威状态 */
+
+test('低频面板: 快照恢复 running 为瞬态——不写入 sessionStorage、刷新后复位（以宿主 /runs 为权威）', () => {
+  const { storage, raw } = makeStorage()
+  const first = new RunStore({ storage })
+  first.patch({
+    // UI v3：快照切片现由产物库承载（panel 只是「当前页」标记，与本用例的断言无关）
+    panel: 'library',
+    snapshots: { selectedId: 'snap-1', running: true },
+    library: { pendingZip: { zipPath: '/exports/x.zip', name: 'x.zip' } },
+  })
+  const persisted = JSON.parse(raw() ?? '{}') as { snapshots?: { running?: boolean }; library?: { pendingZip?: unknown } }
+  assert.equal(persisted.snapshots?.running, false, 'running 恒不落盘（白名单剔除）')
+  assert.equal(persisted.library?.pendingZip, null, '一键导入请求（pendingZip）恒不落盘（一次性瞬态剔除）')
+
+  // 即便旧载荷携带 running=true / pendingZip，applyPersisted 也硬性归零——绝不把浏览器
+  // 陈旧状态当成「恢复仍在执行 / 上一次导入请求」的依据（宿主 /runs 是唯一权威）
+  storage.setItem(STATE_KEY, JSON.stringify({
+    ...persisted,
+    snapshots: { ...persisted.snapshots, running: true },
+    library: { ...persisted.library, pendingZip: { zipPath: '/exports/stale.zip', name: 'stale.zip' } },
+  }))
+  const second = new RunStore({ storage })
+  assert.equal(second.getSnapshot().snapshots.running, false, '刷新后 running 复位（不读存储）')
+  assert.equal(second.getSnapshot().library.pendingZip, null, '刷新后 pendingZip 复位（不读存储）')
+  assert.equal(second.getSnapshot().snapshots.selectedId, 'snap-1', '非瞬态字段仍恢复')
+})
+
+test('UI v3 迁移: 旧 panel "market" → 产物库 + 市场来源筛选；已删的 subTab 字段被忽略', () => {
+  const { storage } = makeStorage()
+  const legacy = {
+    v: 1,
+    view: 'export',
+    export: { mode: 'quick', selection: [], includeSecrets: false, encrypt: false, fileName: '', note: '', error: null },
+    import: { step: 'select', selectedFileName: null, containerEncrypted: false, error: null },
+  }
+  const load = (panel: string, extra: Record<string, unknown> = {}): RunStore => {
+    storage.setItem(STATE_KEY, JSON.stringify({ ...legacy, panel, ...extra } as Record<string, unknown>))
+    return new RunStore({ storage })
+  }
+  // v3 §3.1：市场退出导航 —— 旧「市场页」落到产物库，并预置「市场产物」来源筛选
+  assert.equal(load('market').getSnapshot().panel, 'library', '旧 market 页 → 产物库')
+  assert.equal(load('market').getSnapshot().library.sourceFilter, 'market', '并预置市场来源筛选')
+  // v1 的 snapshots 子视图已解散：restore/files → 产物库；schedule → 首页；recovery → 环境+维护
+  const stale = load('snapshots', { snapshots: { subTab: 'restore', importBackup: null } })
+  assert.equal(stale.getSnapshot().panel, 'library', '旧 snapshots（subTab=restore）→ 产物库')
+  assert.equal('subTab' in stale.getSnapshot().snapshots, false, 'v1 的 snapshots.subTab 字段已删除（不残留）')
+  assert.equal('importBackup' in stale.getSnapshot().snapshots, false, 'v1 的 snapshots.importBackup 字段已删除（不残留）')
+  assert.equal(load('snapshots', { snapshots: { subTab: 'schedule' } }).getSnapshot().panel, 'home', '旧定时备份子视图 → 首页')
+  const rec = load('snapshots', { snapshots: { subTab: 'recovery' } }).getSnapshot()
+  assert.equal(rec.panel, 'environment', '旧事故恢复子视图 → 环境页')
+  assert.equal(rec.profiles.subView, 'maintenance', '并直达维护与诊断')
+  // 认不出的旧值绝不丢页面 —— 一律首页
+  assert.equal(load('nonsense-panel').getSnapshot().panel, 'home', '未知 panel 值 → 首页（不丢页面）')
+})
+
+test('m2-resume: 活跃 restore run 经 /runs 恢复 running 并轮询到完成回填报告（宿主为权威）', async () => {
+  const report: RestoreReport = {
+    snapshotId: 'snap-1',
+    restored: ['settings.yaml'],
+    removedPlugins: ['@scope/pkg'],
+    manualHints: [],
+    failed: [],
+    skipped: [],
+  }
+  const progressResponses: RunState[] = [
+    runningRun('restore', { section: 'restore', item: 1, itemTotal: 3, detail: '整文件还原 settings.yaml' }),
+    {
+      runId: RUN_ID, kind: 'restore', status: 'done',
+      section: null, sectionTotal: null, item: null, itemTotal: null, detail: null, log: [],
+      result: report, createdAt: 1, updatedAt: 3,
+    },
+  ]
+  let progressCalls = 0
+  const api = makeApi({
+    runs: async () => [runningRun('restore')],
+    progress: async () => progressResponses[Math.min(progressCalls++, progressResponses.length - 1)]!,
+  })
+  const store = new RunStore({ storage: null, pollIntervalMs: 5 })
+  const resumed = await store.resume(api)
+  assert.equal(resumed, true, '发现活跃 restore run')
+  assert.equal(store.getSnapshot().snapshots.running, true, 'running 镜像置位（宿主 /runs 为权威）')
+
+  await waitFor(() => {
+    const snap = store.getSnapshot().snapshots
+    return snap.running === false && snap.report !== null
+  }, 2000, 'restore 轮询收敛到完成并回填报告')
+  const snap = store.getSnapshot().snapshots
+  assert.equal(snap.running, false, '完成后 running 复位')
+  assert.deepEqual(snap.report?.restored, ['settings.yaml'], '恢复报告回填 store')
+  assert.equal(snap.actionError, null)
+})
+
+test('m2-resume: store 镜像显示恢复中但 host 无活跃 restore run → 复位并提示不可恢复', async () => {
+  const api = makeApi({ runs: async () => [] })
+  const store = new RunStore({ storage: null })
+  store.patch({ snapshots: { running: true } })
+  const resumed = await store.resume(api)
+  assert.equal(resumed, false)
+  const snap = store.getSnapshot().snapshots
+  assert.equal(snap.running, false, '无宿主 run 时 running 复位（不残留 UI 假状态）')
+  assert.ok(snap.actionError !== null, '如实提示结果不可恢复')
+})
+
+/* -------------------------------------------------- recovery（Phase 5）权威状态 */
+
+test('recovery: running 为瞬态——不写入 sessionStorage、刷新后复位（以宿主 /runs 为权威）', () => {
+  const { storage, raw } = makeStorage()
+  const first = new RunStore({ storage })
+  first.patch({
+    // UI v3：事故恢复归「环境 → 维护与诊断」（panel 只是「当前页」标记）
+    panel: 'environment',
+    recovery: {
+      status: { incidents: [], running: [] },
+      selectedOperationId: '00000000-0000-4000-8000-0000000000aa',
+      preview: null,
+      verifyResult: null,
+      running: true,
+      error: null,
+      actionError: null,
+    },
+  })
+  const persisted = JSON.parse(raw() ?? '{}') as { recovery?: { running?: boolean; selectedOperationId?: string | null } }
+  assert.equal(persisted.recovery?.running, false, 'running 恒不落盘（白名单剔除）')
+  assert.equal(persisted.recovery?.selectedOperationId, '00000000-0000-4000-8000-0000000000aa', '非瞬态字段仍持久化')
+
+  // 即便旧载荷携带 running=true，applyPersisted 也硬性归零——绝不把浏览器陈旧状态
+  // 当成「恢复仍在执行」的依据（宿主 /runs 是唯一权威，resume() 负责重新置位）
+  storage.setItem(STATE_KEY, JSON.stringify({
+    ...persisted,
+    recovery: { ...persisted.recovery, running: true },
+  }))
+  const second = new RunStore({ storage })
+  assert.equal(second.getSnapshot().recovery.running, false, '刷新后 running 复位（不读存储）')
+  assert.equal(second.getSnapshot().recovery.selectedOperationId, '00000000-0000-4000-8000-0000000000aa', '非瞬态字段仍恢复')
+})
+
+test('recovery: status/preview/verifyResult 非敏感可持久化——刷新后恢复', () => {
+  const { storage, raw } = makeStorage()
+  const first = new RunStore({ storage })
+  first.patch({
+    panel: 'environment',
+    recovery: {
+      status: {
+        incidents: [{
+          operationId: '00000000-0000-4000-8000-0000000000aa',
+          operationType: 'import-apply',
+          state: 'NEEDS_ATTENTION',
+          decision: 'rollback-recommended',
+          snapshotId: 'snap-1',
+          reason: '',
+          createdAt: '2026-01-01T00:00:00.000Z',
+        }],
+        running: [],
+      },
+      selectedOperationId: '00000000-0000-4000-8000-0000000000aa',
+      preview: {
+        operationId: '00000000-0000-4000-8000-0000000000aa',
+        operationType: 'import-apply',
+        state: 'NEEDS_ATTENTION',
+        decision: 'rollback-recommended',
+        snapshotId: 'snap-1',
+        snapshotVerdict: 'TRUSTED_OPERATION_SNAPSHOT',
+        snapshotMeta: { id: 'snap-1', createdAt: '2026-01-01T00:00:00.000Z', operationType: 'import-apply' },
+        environmentFingerprint: 'fp',
+        environmentCompatible: true,
+        reason: '',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      },
+      verifyResult: {
+        ok: true,
+        operationId: '00000000-0000-4000-8000-0000000000aa',
+        verdict: 'MATCH',
+        terminal: 'ROLLED_BACK',
+        details: ['快照重验通过'],
+        manualHints: [],
+      },
+      running: false,
+      error: null,
+      actionError: null,
+    },
+  })
+  const persisted = JSON.parse(raw() ?? '{}') as { recovery?: { status?: unknown; preview?: unknown; verifyResult?: unknown } }
+  assert.ok(persisted.recovery?.status !== undefined, 'status 持久化')
+  assert.ok(persisted.recovery?.preview !== undefined, 'preview 持久化')
+  assert.ok(persisted.recovery?.verifyResult !== undefined, 'verifyResult 持久化')
+
+  const second = new RunStore({ storage })
+  const rec = second.getSnapshot().recovery
+  assert.equal(rec.status?.incidents.length, 1, '刷新后恢复 status')
+  assert.equal(rec.preview?.snapshotId, 'snap-1', '刷新后恢复 preview')
+  assert.equal(rec.verifyResult?.verdict, 'MATCH', '刷新后恢复 verifyResult')
+})
+
+test('m2-resume: 活跃 recovery run 经 /runs 恢复 running（宿主为权威）', async () => {
+  const progressResponses: RunState[] = [
+    runningRun('recovery', { section: 'recovery', item: 1, itemTotal: 3, detail: '整文件还原 settings.yaml' }),
+    {
+      runId: RUN_ID, kind: 'recovery', status: 'done',
+      section: null, sectionTotal: null, item: null, itemTotal: null, detail: null, log: [],
+      result: { ok: true, operationId: '00000000-0000-4000-8000-0000000000aa', decision: 'rollback-recommended', state: 'RECOVERING', runId: RUN_ID },
+      createdAt: 1, updatedAt: 3,
+    },
+  ]
+  let progressCalls = 0
+  const api = makeApi({
+    runs: async () => [runningRun('recovery')],
+    progress: async () => progressResponses[Math.min(progressCalls++, progressResponses.length - 1)]!,
+  })
+  const store = new RunStore({ storage: null, pollIntervalMs: 5 })
+  const resumed = await store.resume(api)
+  assert.equal(resumed, true, '发现活跃 recovery run')
+  assert.equal(store.getSnapshot().recovery.running, true, 'running 镜像置位（宿主 /runs 为权威）')
+
+  await waitFor(() => store.getSnapshot().recovery.running === false, 2000, 'recovery 轮询收敛到完成')
+  assert.equal(store.getSnapshot().recovery.running, false, '完成后 running 复位')
+})
+
+test('m2-resume: store 镜像显示恢复中但 host 无活跃 recovery run → 复位并提示不可恢复', async () => {
+  const api = makeApi({ runs: async () => [] })
+  const store = new RunStore({ storage: null })
+  store.patch({ recovery: { running: true } })
+  const resumed = await store.resume(api)
+  assert.equal(resumed, false)
+  const rec = store.getSnapshot().recovery
+  assert.equal(rec.running, false, '无宿主 run 时 running 复位（不残留 UI 假状态）')
+  assert.ok(rec.actionError !== null, '如实提示结果不可恢复')
+})
+
+/* --------------------------------- P0-8 导入失败后不再卡在 step='importing' */
+
+test('P0-8: 导入执行抛错 → 向导 step 回退到执行前（确认页），store 镜像不滞留 importing', async () => {
+  const api = makeApi({
+    createImportPlan: async () => makePlan(),
+    executeImportPlan: async () => { throw new Error('宿主执行失败：备份文件不可读') },
+  })
+  const store = new RunStore({ storage: null })
+  // 先落到「确认页」状态，再取 store 缓存的控制器 —— 控制器由 store rehydrate（与视图同一条链）
+  store.patch({
+    import: {
+      step: 'preview', phase: 'confirm', zipPath: '/tmp/x.zip',
+      analysis: makeAnalysis(), plan: makePlan(),
+    },
+  })
+  const wizard = store.importWizard(api)
+  assert.equal(wizard.snapshot().step, 'preview')
+
+  await assert.rejects(() => wizard.execute({ confirm: true }), /宿主执行失败/)
+  assert.equal(wizard.snapshot().step, 'preview', '控制器回退到执行前的确认页（可重试）')
+  assert.notEqual(wizard.snapshot().step, 'importing', '控制器不得停留在 importing')
+  assert.ok(wizard.snapshot().errors.length > 0, '失败原因进 errors（结果/确认页可见）')
+
+  // 视图的 catch 会 syncWizard()（ImportWizardView.tsx 的 execute catch）→ store 跟随控制器
+  store.syncWizard()
+  const imp = store.getSnapshot().import
+  assert.notEqual(imp.step, 'importing', 'store 镜像不得滞留 importing')
+  assert.equal(imp.step, 'preview', '回到确认页（有「确认导入」与错误重试入口）')
+  assert.equal(imp.plan !== null, true, '计划保留 —— 用户可直接重试，无需重走向导')
+})
+
+test('P0-8: 结果页「重试」失败 → step 回退到结果页（不吞掉结果报告）', async () => {
+  const plan = makePlan({ items: [makePlanItem({ id: 'plugin:x', kind: 'Install', adapter: 'plugins' })] })
+  const result = makeImportResult({ executed: [{ itemId: 'plugin:x', status: 'failed' }] })
+  const api = makeApi({
+    createImportPlan: async () => plan,
+    executeImportPlan: async () => { throw new Error('宿主执行失败：重试仍然失败') },
+  })
+  const store = new RunStore({ storage: null })
+  store.patch({
+    import: { step: 'result', phase: 'confirm', zipPath: '/tmp/x.zip', analysis: makeAnalysis(), plan, result },
+  })
+  const wizard = store.importWizard(api)
+  assert.equal(wizard.snapshot().step, 'result')
+
+  await assert.rejects(() => wizard.executeRetry({}), /重试仍然失败/)
+  assert.equal(wizard.snapshot().step, 'result', '重试失败回到结果页（可再次重试，报告不丢）')
+  store.syncWizard()
+  assert.equal(store.getSnapshot().import.step, 'result')
+})
+
+test('P0-8: 轮询发现 import run 失败 → store 兜底回到确认页（不再停在 importing）', async () => {
+  const failed: RunState = {
+    runId: RUN_ID, kind: 'import', status: 'failed',
+    section: null, sectionTotal: null, item: null, itemTotal: null, detail: null, log: [],
+    error: '宿主执行失败：单项 apply 抛错', createdAt: 1, updatedAt: 3,
+  }
+  const api = makeApi({
+    runs: async () => [runningRun('import')],
+    progress: async () => failed,
+  })
+  const store = new RunStore({ storage: null, pollIntervalMs: 5 })
+  store.patch({
+    import: {
+      step: 'importing', running: true, runId: RUN_ID, zipPath: '/tmp/x.zip',
+      analysis: makeAnalysis(), plan: makePlan(),
+    },
+  })
+  store.importWizard(api) // 控制器 rehydrate 为 importing（轮询失败时它还没回退）
+  store.watchRunning('import', 5)
+
+  await waitFor(() => store.getSnapshot().import.error !== null, 2000, '失败回填 error')
+  const imp = store.getSnapshot().import
+  assert.notEqual(imp.step, 'importing', '不得滞留 importing')
+  assert.equal(imp.step, 'preview', '兜底回到确认页（可重试）')
+  assert.equal(imp.running, false)
+  assert.equal(imp.progress, null)
+  assert.ok(imp.errors.length > 0, '失败原因进 errors')
+  store.stopResume()
+})
+
+/* --------------------------- P0-9 落盘前统一脱敏 + 默认拒绝、显式放行 */
+
+/** P0-9 夹具用的明文凭据形态（命中 kv 字段名 + sk- 值形状两道规则）。 */
+const P0_9_SECRET = 'sk-live-ABCDEFGH12345678'
+
+test('P0-9: 宿主载荷（plan/analysis/result/confirmSession/snapshots.plan/market.detail）落盘前已脱敏', () => {
+  const { storage, raw } = makeStorage()
+  const store = new RunStore({ storage })
+  const analysis = makeAnalysis({ warnings: [`MCP_TOKEN=${P0_9_SECRET}`] })
+  const plan = makePlan({
+    items: [
+      makePlanItem({ id: 'settings:general', kind: 'Create', description: '创建设置 general' }),
+      makePlanItem({
+        id: 'secret:K1', kind: 'MissingSecret', adapter: 'credentialsStatus', description: '凭据 K1 需要补录',
+      }),
+      makePlanItem({
+        id: 'mcp:srv', kind: 'Create', adapter: 'mcp', description: '创建 MCP srv',
+        detail: `env={"MCP_TOKEN":"${P0_9_SECRET}"}`,
+      }),
+    ],
+  })
+  const result = makeImportResult({ warnings: [`Authorization: Bearer ${P0_9_SECRET}`] })
+  const confirmSession: SyncStartResponse = {
+    ok: true, syncSessionId: 'sync-session-p09', snapshotId: 'snap-1',
+    needsReview: true, compatibility: 'good',
+    items: [{
+      itemId: 'mcp:srv', adapter: 'mcp', kind: 'Conflict', description: '更新 MCP srv',
+      severity: 'warning', defaultAdopt: false, adopt: false,
+      detail: `MCP_TOKEN=${P0_9_SECRET}`,
+      conflict: {
+        path: 'mcp.json', kind: 'key',
+        local: { MCP_TOKEN: P0_9_SECRET },
+        diff: `-"MCP_TOKEN": "${P0_9_SECRET}"`,
+      },
+    }],
+  }
+  store.patch({
+    import: { analysis, plan, result, conflictResolutions: { 'secret:K1': 'useImported' } },
+    sync: { confirmSession },
+    snapshots: {
+      plan: {
+        snapshotId: 'snap-1', createdAt: '2026-01-01T00:00:00Z', sourceZip: 'x.zip',
+        actions: [{
+          kind: 'credentialHint', description: '凭据补录',
+          detail: `MCP_TOKEN=${P0_9_SECRET}`, manualHint: `Authorization: Bearer ${P0_9_SECRET}`,
+        }],
+        summary: {
+          hostFileRestores: 0, hostFileRemoves: 0, pluginRemoves: 0,
+          fileRestores: 0, fileRemoves: 0, credentialHints: 1, skips: 0,
+        },
+        pluginBaselineConfirmed: true,
+      },
+    },
+    market: {
+      detail: {
+        id: 'm1', name: 'Market A', version: '1.0.0', sections: ['settings'],
+        downloadedAt: '2026-01-01T00:00:00Z', status: 'valid', warnings: ['第三方来源'],
+        zipPath: '/tmp/market-m1.zip', analysis, plan,
+      },
+    },
+  })
+
+  const text = raw()
+  assert.ok(text !== null, 'patch 后已同步持久化')
+  assert.ok(!text.includes(P0_9_SECRET), '明文密钥不得落入 sessionStorage')
+  assert.ok(text.includes('***REDACTED***'), '命中敏感形态的值替换为 REDACTED 标记')
+
+  const persisted = toPersistedState(store.getSnapshot())
+  // 覆盖点逐个确认（任一漏点都会让上面的整体断言失败，这里给出可定位的失败信息）
+  assert.ok(!JSON.stringify(persisted.import.analysis).includes(P0_9_SECRET), 'analysis 已脱敏')
+  assert.ok(!JSON.stringify(persisted.import.plan).includes(P0_9_SECRET), 'plan 已脱敏')
+  assert.ok(!JSON.stringify(persisted.import.result).includes(P0_9_SECRET), 'result 已脱敏')
+  assert.ok(!JSON.stringify(persisted.sync.confirmSession).includes(P0_9_SECRET), 'confirmSession（含 conflict.diff/local）已脱敏')
+  assert.ok(!JSON.stringify(persisted.snapshots.plan).includes(P0_9_SECRET), 'snapshots.plan 已脱敏')
+  assert.ok(!JSON.stringify(persisted.market.detail).includes(P0_9_SECRET), 'market.detail（含 plan/analysis）已脱敏')
+
+  // 反向：不能误伤 —— 无敏感形态的文本原样保留，功能字段（id / 决策键）不被改写
+  assert.equal(persisted.import.plan?.items[0]?.description, '创建设置 general', '普通描述原样保留')
+  assert.equal(persisted.import.plan?.items[1]?.id, 'secret:K1', 'plan item id 是功能字段（宿主按它执行）→ 不脱敏')
+  assert.deepEqual(persisted.import.conflictResolutions, { 'secret:K1': 'useImported' }, '逐项决策按 item id 键控 → 不脱敏')
+  assert.equal(persisted.sync.confirmSession?.items[0]?.itemId, 'mcp:srv', '确认项 itemId 是功能字段 → 不脱敏')
+})
+
+test('P0-9: redactPersistedValue 只递归普通对象/数组（Date/Uint8Array 不重建）', () => {
+  const when = new Date('2026-01-01T00:00:00Z')
+  assert.equal(redactPersistedValue(when), when, 'Date 原样返回')
+  const bytes = new Uint8Array([1, 2, 3])
+  assert.equal(redactPersistedValue(bytes), bytes, 'Uint8Array 原样返回')
+  assert.equal(redactPersistedValue('TOKEN=abc123'), 'TOKEN=***REDACTED***', '字符串按字段名形态脱敏')
+  assert.equal(redactPersistedValue('TOKEN=abc123'), redactPersistedValue('TOKEN=abc123'), '幂等')
+})
+
+test('P0-9: 放行清单之外的未知字段默认不落盘（各切片，含 byChannel）', () => {
+  const { storage, raw } = makeStorage()
+  const store = new RunStore({ storage })
+  store.patch({ export: { selection: ['settings'] } })
+  // 模拟「未来往各切片加了一个敏感字段」：默认拒绝 → 不得落盘
+  const snap = store.getSnapshot() as unknown as {
+    export: Record<string, unknown>
+    import: Record<string, unknown>
+    sync: Record<string, unknown> & { byChannel: { git: Record<string, unknown> } }
+    market: Record<string, unknown>
+    snapshots: Record<string, unknown>
+    profiles: Record<string, unknown>
+    recovery: Record<string, unknown>
+    task: Record<string, unknown>
+  }
+  snap.export['futureSecret'] = 'LEAK-EXPORT'
+  snap.import['futureToken'] = 'LEAK-IMPORT'
+  snap.sync['futurePassword'] = 'LEAK-SYNC'
+  snap.sync.byChannel.git['futureSecret'] = 'LEAK-CHANNEL'
+  snap.market['futureKey'] = 'LEAK-MARKET'
+  snap.snapshots['futureSecret'] = 'LEAK-SNAPSHOTS'
+  snap.profiles['futureSecret'] = 'LEAK-PROFILES'
+  snap.recovery['futureSecret'] = 'LEAK-RECOVERY'
+  // v2：task 面板整体不落盘（不是字段级白名单，是整块剔除）；默认是 null，先塞一个对象
+  snap.task = { futureSecret: 'LEAK-TASK' }
+
+  store.save() // 走唯一写盘路径
+  const text = raw()
+  assert.ok(text !== null)
+  for (const leak of [
+    'LEAK-EXPORT', 'LEAK-IMPORT', 'LEAK-SYNC', 'LEAK-CHANNEL',
+    'LEAK-MARKET', 'LEAK-SNAPSHOTS', 'LEAK-PROFILES', 'LEAK-RECOVERY', 'LEAK-TASK',
+  ]) {
+    assert.ok(!text.includes(leak), `${leak} 不得落盘（放行清单之外默认拒绝）`)
+  }
+  assert.deepEqual(toPersistedState(store.getSnapshot()).export.selection, ['settings'], '显式放行字段仍落盘')
+})
+
+test('P0-9: 持久化字段清单显式化（键集合断言 —— 新增字段必须显式放行）', () => {
+  const store = new RunStore({ storage: null })
+  const p: PersistedState = toPersistedState(store.getSnapshot())
+  const keys = (o: object): string[] => Object.keys(o).sort()
+  assert.deepEqual(keys(p.export), ['encrypt', 'error', 'excludedUnits', 'fileName', 'includeSecrets', 'note', 'selection'])
+  assert.deepEqual(keys(p.import), [
+    'analysis', 'conflictResolutions', 'conflictStrategy', 'containerEncrypted', 'error', 'errors',
+    'importSelection', 'pathMappings', 'phase', 'plan', 'progress', 'result', 'rollbackOnError',
+    'runId', 'running', 'selectedFileName', 'sessionFormatDisposition', 'step', 'uploading', 'zipPath',
+  ])
+  assert.deepEqual(keys(p.sync), [
+    'byChannel', 'channel', 'confirmDecisions', 'confirmSession', 'error', 'lastRestoreId',
+    'loadError', 'pullReport', 'pushPreview', 'pushReport', 'repoUrl', 'webdavUrl', 'webdavUsername',
+  ])
+  assert.deepEqual(keys(p.sync.byChannel.git), [
+    'autosync', 'autosyncEnabled', 'autosyncInterval', 'autosyncRealtime', 'encrypt', 'includeSecrets',
+    'loadingSnapshots', 'selectedSnapshotId', 'sessionsInclude', 'sessionsLimit', 'snapshots',
+    'syncMode', 'syncSections',
+  ])
+  assert.deepEqual(keys(p.market), [
+    'category', 'conflictResolutions', 'detail', 'error', 'importResult', 'items', 'loadError',
+    'myConfirmDeleteId', 'myInstall', 'myItems', 'myItemsError', 'myWizard', 'search',
+    'sectionFilter', 'selectionState', 'sortKey', 'source', 'subView',
+  ])
+  assert.deepEqual(keys(p.snapshots), [
+    'actionError', 'backupDraft', 'changeSummary', 'error', 'plan', 'report',
+    'running', 'selectedId',
+  ])
+  assert.deepEqual(keys(p.profiles), [
+    'copyIncludeModules', 'copyResult', 'copyTargetName', 'copyValue', 'copying',
+    'createName', 'createTemplate', 'creating', 'current', 'deleteCurrentConfirmed', 'deleteTargetName',
+    'deleting', 'error', 'launchBlocked', 'launchResult', 'launching', 'loadError', 'profiles',
+    'renameTargetName', 'renameValue', 'renaming', 'running', 'selectedName', 'stopTargetName', 'stopping',
+    'subView', 'templates',
+  ])
+  assert.deepEqual(keys(p.recovery), ['actionError', 'error', 'preview', 'running', 'selectedOperationId', 'status', 'verifyResult'])
+  // v2：抽屉已废弃 → persisted 里既没有 more（子视图），也没有 task（面板开关是瞬态）。
+  // 这两条是「新字段默认不落盘」的回归护栏：将来往 StoreState 加瞬态字段忘了剔除，这里会红。
+  assert.equal('more' in p, false, 'more 切片已随抽屉废弃')
+  assert.equal('task' in p, false, 'task 面板不持久化')
+  // 瞬态与凭据不得出现在任何切片（回归护栏）
+  assert.equal(p.snapshots.running, false)
+  assert.equal(p.library.pendingZip, null, '一键导入请求恒不落盘（一次性瞬态剔除）')
+  assert.equal(p.recovery.running, false)
+})
+
+/* ----------------- 档案面板：进行中态随模块级单例跨挂载存活（真机 bug 回归） */
+
+/** 启动回执样本：url 带认证 token —— 它在内存切片里合法，落盘就是缺陷。 */
+const PROFILE_LAUNCH_TOKEN = 'PROFILE-TOKEN-DEADBEEF'
+const PROFILE_LAUNCH_RESULT: DshProfileLaunchResult = {
+  name: 'cmtest',
+  mode: 'web',
+  port: 3102,
+  url: 'http://127.0.0.1:3102/?token=' + PROFILE_LAUNCH_TOKEN,
+  pid: 4242,
+  logFile: 'C:\\dsh\\logs\\launch-cmtest-3102.log',
+  ready: true,
+  warnings: [],
+}
+const PROFILE_TEMPLATE_FIXTURE: DshProfileTemplate = {
+  id: 'web',
+  bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'],
+  patchReload: 'live',
+}
+/** 复制回执样本：带 warnings（没带 node_modules 的副本不能直接启动）—— 同样是内存瞬态。 */
+const PROFILE_COPY_RESULT: DshProfileCopyResult = {
+  name: 'cmtest-copy',
+  sourceName: 'cmtest',
+  includeNodeModules: false,
+  durationMs: 12,
+  warnings: ['depsNotInstalled'],
+}
+
+test('档案面板：状态镜像不漏字段（漏字段 = 切页签丢「启动中 / 停止中」）', () => {
+  const store = new RunStore({ storage: null })
+  const base = store.getSnapshot().profiles
+  const full: ProfilesStoreSlice = {
+    ...base,
+    launching: 'cmtest',
+    stopping: 'web',
+    creating: true,
+    renaming: true,
+    deleting: true,
+    renameTargetName: 'a',
+    renameValue: 'b',
+    deleteTargetName: 'c',
+    deleteCurrentConfirmed: true,
+    stopTargetName: 'web',
+    launchBlocked: 'base',
+    launchResult: PROFILE_LAUNCH_RESULT,
+  }
+  const mirrored = toProfilesStoreSlice(full)
+  assert.deepEqual(Object.keys(mirrored).sort(), Object.keys(base).sort(), '切片键集合必须与面板状态一一对应')
+  assert.deepEqual(mirrored, full, '逐字段照搬：漏一个字段就会在切页签（组件卸载重挂）后归零')
+})
+
+test('档案面板：进行中操作/弹窗目标/启动回执为内存态（切页签保留、刷新清空、token 不落盘）', () => {
+  const { storage, raw } = makeStorage()
+  const store = new RunStore({ storage })
+  store.patch({
+    profiles: {
+      launching: 'cmtest',
+      stopping: 'web',
+      creating: true,
+      renaming: true,
+      deleting: true,
+      renameTargetName: 'a',
+      renameValue: 'b',
+      deleteTargetName: 'c',
+      deleteCurrentConfirmed: true,
+      stopTargetName: 'web',
+      launchBlocked: 'base',
+      launchResult: PROFILE_LAUNCH_RESULT,
+      copying: true,
+      copyTargetName: 'cmtest',
+      copyValue: 'cmtest-copy',
+      copyIncludeModules: false,
+      copyResult: PROFILE_COPY_RESULT,
+      createName: 'my-profile',
+      createTemplate: 'web',
+      selectedName: 'cmtest',
+      templates: [PROFILE_TEMPLATE_FIXTURE],
+    },
+  })
+  // 模块级单例：同一 JS 上下文（= 切页签，组件卸载重挂）里这些字段原样保留
+  assert.equal(store.getSnapshot().profiles.launching, 'cmtest')
+  const text = raw()
+  assert.ok(text !== null)
+  assert.ok(!text.includes(PROFILE_LAUNCH_TOKEN), '认证 token 绝不进 sessionStorage')
+
+  // 刷新恢复路径：同一份存储新建 store（等于刷新页面）
+  const after = new RunStore({ storage }).getSnapshot().profiles
+  assert.equal(after.launching, null, '进行中操作不跨刷新（发起请求的页面已销毁）')
+  assert.equal(after.stopping, null)
+  assert.equal(after.creating, false)
+  assert.equal(after.renaming, false)
+  assert.equal(after.deleting, false)
+  assert.equal(after.renameTargetName, null)
+  assert.equal(after.deleteTargetName, null)
+  assert.equal(after.stopTargetName, null)
+  assert.equal(after.launchResult, null, '回执带 token → 刷新后清空')
+  assert.equal(after.launchBlocked, null)
+  assert.equal(after.copying, false, '复制进行中同样是瞬态（发起请求的页面已销毁）')
+  assert.equal(after.copyTargetName, null)
+  assert.equal(after.copyValue, '')
+  assert.equal(after.copyIncludeModules, true, '开关回到默认（下次打开弹窗按源档案现算）')
+  assert.equal(after.copyResult, null)
+  assert.equal(after.createName, 'my-profile', '表单草稿跨刷新保留')
+  assert.equal(after.createTemplate, 'web')
+  assert.equal(after.selectedName, 'cmtest', '详情目标跨刷新保留（正文挂载后按名重取）')
+  assert.deepEqual(after.templates, [], 'templates 是宿主数据（每次 load 重取），不进持久化载荷')
+})
+
+test('normalizeProfilesSlice：只恢复磁盘上有意义的字段，瞬态一律回默认', () => {
+  const restored = normalizeProfilesSlice({
+    profiles: [{ name: 'web', dir: '/x/profiles/web', bundles: [] }],
+    running: [{ name: 'web', pid: 1, port: 3000 }],
+    current: 'web',
+    selectedName: 'web',
+    error: null,
+    loadError: null,
+    createName: 'draft',
+    createTemplate: 'base',
+    creating: true,
+    launching: 'web',
+    renameTargetName: 'web',
+    renameValue: 'x',
+    renaming: true,
+    deleteTargetName: 'web',
+    deleteCurrentConfirmed: true,
+    deleting: true,
+    stopping: 'web',
+    stopTargetName: 'web',
+    launchResult: PROFILE_LAUNCH_RESULT,
+    launchBlocked: 'base',
+    copying: true,
+    copyTargetName: 'web',
+    copyValue: 'web-copy',
+    copyIncludeModules: false,
+    copyResult: PROFILE_COPY_RESULT,
+    templates: [PROFILE_TEMPLATE_FIXTURE],
+  })
+  assert.equal(restored.profiles?.length, 1, '列表恢复')
+  assert.equal(restored.current, 'web')
+  assert.equal(restored.selectedName, 'web')
+  assert.equal(restored.createName, 'draft')
+  assert.equal(restored.createTemplate, 'base')
+  assert.deepEqual(restored.running, [], 'running 是机器本地瞬态（pid 只在本次开机有意义）')
+  assert.deepEqual(restored.templates, [], 'templates 是宿主数据，不从载荷恢复')
+  assert.equal(restored.creating, false)
+  assert.equal(restored.renaming, false)
+  assert.equal(restored.deleting, false)
+  assert.equal(restored.launching, null)
+  assert.equal(restored.stopping, null)
+  assert.equal(restored.renameTargetName, null)
+  assert.equal(restored.deleteTargetName, null)
+  assert.equal(restored.stopTargetName, null)
+  assert.equal(restored.launchResult, null)
+  assert.equal(restored.launchBlocked, null)
+  assert.equal(restored.renameValue, '')
+  assert.equal(restored.copying, false)
+  assert.equal(restored.copyTargetName, null)
+  assert.equal(restored.copyValue, '')
+  assert.equal(restored.copyIncludeModules, true)
+  assert.equal(restored.copyResult, null)
+})
+
+/* ------------------- t27：脱敏结果按引用缓存（回收 P0-9 的性能代价） */
+
+/** 第二条明文凭据形态（替换/失效用例用；与 P0_9_SECRET 不同值）。 */
+const T27_SECRET = 'sk-live-ZZZZZZZZ99999999'
+
+test('t27: 同一对象引用 → 复用脱敏结果（不重复深脱敏）；对象被替换 → 缓存失效并重算', () => {
+  const { storage } = makeStorage()
+  const store = new RunStore({ storage })
+  const plan = makePlan({
+    items: [makePlanItem({ id: 'mcp:srv', adapter: 'mcp', kind: 'Create', description: '创建 MCP srv', detail: `MCP_TOKEN=${P0_9_SECRET}` })],
+  })
+  store.patch({ import: { plan } })
+
+  const first = toPersistedState(store.getSnapshot())
+  const second = toPersistedState(store.getSnapshot())
+  // 引用相同 = 直接复用缓存对象（重新计算必然产生新对象）→ 证明没有重复深脱敏
+  assert.equal(second.import.plan, first.import.plan, '同一引用未变化 → 命中缓存，复用同一结果对象')
+  assert.equal(second.import.plan?.items[0]?.detail, 'MCP_TOKEN=***REDACTED***', '命中的结果仍是脱敏后的值')
+  assert.ok(!JSON.stringify(second.import.plan).includes(P0_9_SECRET), '缓存命中不得把明文带回来')
+
+  // 对象被替换（引用变化）→ 必须重算：新载荷的新敏感值也要脱敏
+  const replaced = makePlan({
+    items: [makePlanItem({ id: 'mcp:srv', adapter: 'mcp', kind: 'Create', description: '创建 MCP srv', detail: `MCP_TOKEN=${T27_SECRET}` })],
+  })
+  store.patch({ import: { plan: replaced } })
+  const third = toPersistedState(store.getSnapshot())
+  assert.notEqual(third.import.plan, second.import.plan, '引用变化 → 不得复用旧缓存结果')
+  assert.ok(!JSON.stringify(third.import.plan).includes(T27_SECRET), '替换后的新载荷同样被脱敏（缓存不得掩盖内容变化）')
+  assert.ok(JSON.stringify(third.import.plan).includes('***REDACTED***'))
+})
+
+test('t27: 缓存命中的输出与冷路径（同内容新引用）逐字段一致', () => {
+  const { storage } = makeStorage()
+  const store = new RunStore({ storage })
+  const analysis = makeAnalysis({ warnings: [`MCP_TOKEN=${P0_9_SECRET}`] })
+  const plan = makePlan({
+    items: [
+      makePlanItem({ id: 'settings:general', kind: 'Create', description: '创建设置 general' }),
+      makePlanItem({ id: 'secret:K1', kind: 'MissingSecret', adapter: 'credentialsStatus', description: '凭据 K1 需要补录' }),
+      makePlanItem({ id: 'mcp:srv', kind: 'Create', adapter: 'mcp', detail: `env={"MCP_TOKEN":"${P0_9_SECRET}"}` }),
+    ],
+  })
+  const result = makeImportResult({ warnings: [`Authorization: Bearer ${P0_9_SECRET}`] })
+  store.patch({ import: { analysis, plan, result } })
+
+  const warm = toPersistedState(store.getSnapshot())          // 第二次起走缓存
+  const warmAgain = toPersistedState(store.getSnapshot())
+  assert.equal(warmAgain.import.plan, warm.import.plan, '第二次调用命中缓存')
+
+  // 冷路径：deepClone 造出「内容相同、引用全新」的载荷 → 必然重新计算
+  const coldStore = new RunStore({ storage: null })
+  coldStore.patch({
+    import: {
+      analysis: structuredClone(analysis),
+      plan: structuredClone(plan),
+      result: structuredClone(result),
+    },
+  })
+  const cold = toPersistedState(coldStore.getSnapshot())
+  assert.notEqual(cold.import.plan, warm.import.plan, '冷路径是不同对象（确为重新计算）')
+  assert.deepEqual(cold.import, warm.import, '缓存命中与冷路径的 import 投影逐字段一致')
+  assert.deepEqual(cold.sync, warm.sync)
+  assert.deepEqual(cold.snapshots, warm.snapshots)
+  // 功能字段与普通文本也不能被缓存路径改写
+  assert.equal(warm.import.plan?.items[1]?.id, 'secret:K1')
+  assert.equal(warm.import.plan?.items[0]?.description, '创建设置 general')
+})
+
+/** 造一条 levels 层嵌套的对象链（最深处放一个可指定的叶子值）。 */
+function nestChain(levels: number, leaf: Record<string, unknown>): Record<string, unknown> {
+  const root: Record<string, unknown> = {}
+  let node = root
+  for (let i = 0; i < levels; i++) {
+    const next: Record<string, unknown> = {}
+    node['child'] = next
+    node = next
+  }
+  Object.assign(node, leaf)
+  return root
+}
+
+test('t27: 深度上限处的替换行为不因缓存而改变（同一载荷两个深度各留一份）', () => {
+  // 40 层嵌套：超过 REDACT_MAX_DEPTH=32 → 超限子树整棵替换为占位（t38 起），
+  // 缓存按「引用 + 深度」分开存，所以命中路径与冷路径必须给出完全一样的结果。
+  const deep = (levels: number): Record<string, unknown> => {
+    const root: Record<string, unknown> = {}
+    let node = root
+    for (let i = 0; i < levels; i++) {
+      const next: Record<string, unknown> = {}
+      node['child'] = next
+      node = next
+    }
+    node['token'] = `MCP_TOKEN=${P0_9_SECRET}`
+    return root
+  }
+  const payload = { deep: deep(40), shallow: { detail: `MCP_TOKEN=${P0_9_SECRET}` } }
+  const warm = redactPersistedValue(payload)
+  const warmAgain = redactPersistedValue(payload)
+  assert.equal(warmAgain, warm, '同一引用重复调用复用缓存对象')
+  const cold = redactPersistedValue(structuredClone(payload))
+  assert.deepEqual(cold, warm, '命中缓存与冷计算输出一致（含超限子树替换处）')
+  // t38 起超限子树整棵替换为占位 → 深层明文不再穿透（原「不脱敏」断言已随之翻转）
+  assert.equal(JSON.stringify(warm).includes(P0_9_SECRET), false, '超限子树内的明文不得出现在结果里')
+  assert.equal(warm.shallow.detail, 'MCP_TOKEN=***REDACTED***', '上限内的浅处仍按常规规则脱敏')
+  // 下钻到超限边界：payload 根 = 0 层、deep 链首节点 = 1 层，替换发生在第 32 层
+  let node: unknown = warm.deep
+  let depth = 1
+  while (typeof node === 'object' && node !== null && depth < 64) {
+    node = (node as Record<string, unknown>)['child']
+    depth += 1
+  }
+  assert.equal(node, REDACTED, `超限子树整棵替换为占位（同一引用时命中缓存里的占位；实际在第 ${depth} 层停止下钻）`)
+  assert.equal(depth, 32, '替换发生在第 32 层（= REDACT_MAX_DEPTH）')
+})
+
+test('t38: 超深子树整棵替换为占位 —— 第 33 层及更深的 sk- 值不进入落盘结果', () => {
+  const { storage, raw } = makeStorage()
+  const store = new RunStore({ storage })
+  // 绝对深度：plan 根 = 0 层、deepBranch = 1 层，之后每层 child +1。
+  // 在第 33 / 35 / 37 层各挂一个明文 sk- 值 —— 它们的父节点在第 32 层（= REDACT_MAX_DEPTH）起被整棵替换。
+  const branch = nestChain(36, {})
+  for (const absoluteDepth of [33, 35, 37]) {
+    let node: Record<string, unknown> = branch
+    for (let depth = 2; depth <= absoluteDepth - 1; depth += 1) {
+      node = node['child'] as Record<string, unknown>
+    }
+    node['token'] = `MCP_TOKEN=${P0_9_SECRET}`
+  }
+  const plan = {
+    ...makePlan({
+      items: [makePlanItem({
+        id: 'mcp:srv', adapter: 'mcp', kind: 'Create', description: '创建 MCP srv',
+        detail: `MCP_TOKEN=${P0_9_SECRET}`,
+      })],
+    }),
+    deepBranch: branch,
+  }
+  store.patch({ import: { plan: plan as unknown as ImportPlan } })
+
+  const text = raw()
+  assert.ok(text !== null, 'patch 后已同步持久化')
+  assert.equal(text.includes(P0_9_SECRET), false, '第 33 层及更深的明文 sk- 值不得进入落盘结果')
+  const persisted = toPersistedState(store.getSnapshot())
+  assert.equal(JSON.stringify(persisted.import.plan).includes(P0_9_SECRET), false, 'plan 里的深层明文同样不落盘')
+  // 覆盖未缩小：上限内的那一个明文照常被 redact()
+  assert.equal(persisted.import.plan?.items[0]?.detail, 'MCP_TOKEN=***REDACTED***', '上限内的明文仍按常规规则脱敏')
+  // 超限子树整棵替换：从 deepBranch（1 层）下钻，在第 32 层停止且该处是占位
+  let node: unknown = (persisted.import.plan as unknown as Record<string, unknown>)['deepBranch']
+  let depth = 1
+  while (typeof node === 'object' && node !== null && depth < 64) {
+    node = (node as Record<string, unknown>)['child']
+    depth += 1
+  }
+  assert.equal(node, REDACTED, `超限处应为占位（实际在第 ${depth} 层停止下钻）`)
+  assert.equal(depth, 32, '整棵替换发生在第 32 层（= REDACT_MAX_DEPTH）')
+})
+
+test('t38: 同一对象在浅处与超限处各留一份 —— 深度仍参与缓存键、互不污染', () => {
+  const shared = { detail: `MCP_TOKEN=${P0_9_SECRET}` }
+  const payload = { shallow: shared, deep: nestChain(40, { leaf: shared }) }
+  const out = redactPersistedValue(payload)
+  assert.equal(out.shallow.detail, 'MCP_TOKEN=***REDACTED***', '浅处的同一对象按常规规则脱敏')
+  let node: unknown = out.deep
+  while (typeof node === 'object' && node !== null) node = (node as Record<string, unknown>)['child']
+  assert.equal(node, REDACTED, '深处的同一对象被整棵替换为占位（缓存未把浅处结果串到深处）')
+  assert.equal(JSON.stringify(out).includes(P0_9_SECRET), false, '两种深度都不泄漏明文')
+})

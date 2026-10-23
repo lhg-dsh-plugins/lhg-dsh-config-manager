@@ -1,0 +1,236 @@
+/**
+ * 报告渲染（规范 §21 导出报告 / §22 导入报告 / §17 回滚报告，m6-ui）。
+ *
+ * 纯文本渲染：输出用户可读的多行文本（未来 React 客户端可直接替换为组件渲染）。
+ * 导入报告按分区统计：从 ExecutedItem.itemId 前缀推断所属分区（与 adapters 的 id 规则一致）。
+ */
+import type { SectionId } from '../schema/types.ts';
+import type {
+  ExecutedItem, ExportReport, ImportResult, RollbackReport,
+} from '../core/types.ts';
+import type { ImportResultAction, ImportSectionStat } from './types.ts';
+import type { UiT, UiTextKey } from './i18n.ts';
+
+/* ---------------- §21 导出报告 ---------------- */
+
+/**
+ * 分区条目计数的单位词（adapter 的 counts 键 → 字典键）。
+ *
+ * 为什么必须映射：counts 的键是**适配器内部词汇**（namespaces / patchLines / servers），
+ * 原先直接拼进报告文本，中文界面上就出现了「settings (18 namespaces)」这种半英文行。
+ * 未知键回退原样显示（不吞信息、不显示 undefined）——新适配器忘配文案只是不够漂亮，
+ * 不会丢数据。
+ */
+const COUNT_UNIT_KEY: Record<string, UiTextKey> = {
+  namespaces: 'report.unit.namespaces',
+  files: 'report.unit.files',
+  servers: 'report.unit.servers',
+  providers: 'report.unit.providers',
+  plugins: 'report.unit.plugins',
+  patchLines: 'report.unit.patchLines',
+  patchFiles: 'report.unit.patchFiles',
+  localTarballs: 'report.unit.localTarballs',
+  prompts: 'report.unit.prompts',
+  workspaces: 'report.unit.workspaces',
+  credentials: 'report.unit.credentials',
+  notes: 'report.unit.notes',
+};
+
+/**
+ * 一个分区的 counts → 一行中文计数文本（如「18 个命名空间，3 条说明」）。
+ * 空 counts → 空串（调用方按「—」渲染，不要在这里编一个 0）。
+ */
+export function exportCountsText(counts: Record<string, number>, t: UiT): string {
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(counts)) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+    const unitKey = COUNT_UNIT_KEY[key];
+    parts.push(unitKey === undefined ? String(value) + ' ' + key : String(value) + ' ' + t(unitKey));
+  }
+  // 分隔符也走字典：英文用半角逗号（全角标点在英文界面同样是缺陷）
+  return parts.join(t('report.unitSeparator'));
+}
+
+export function renderExportReport(report: ExportReport, t: UiT): string {
+  const lines: string[] = [t('report.backupCreated'), ''];
+  lines.push(t('report.included'));
+  for (const { section, counts } of report.included) {
+    const detail = Object.entries(counts)
+      .map(([k, v]) => `${v} ${k}`)
+      .join(', ');
+    lines.push(`  ✓ ${section}${detail !== '' ? ` (${detail})` : ''}`);
+  }
+  lines.push('');
+  if (report.excluded.length > 0) {
+    lines.push(t('report.excluded'));
+    for (const s of report.excluded) lines.push(`  ○ ${s}`);
+    lines.push('');
+  }
+  lines.push(t('report.security'));
+  lines.push(`  ✓ ${t('report.apiKeysExcluded')} ${report.security.secretsExcluded ? t('report.yes') : t('report.no')}`);
+  lines.push(`  ✓ ${t('report.containsSecrets')} ${report.security.containsSecrets ? t('report.yesEncrypted') : t('report.no')}`);
+  lines.push(`  ✓ ${t('report.encrypted')} ${report.security.encrypted ? t('report.yes') : t('report.no')}`);
+  if (report.security.redactedHits > 0) lines.push(`  ⚠ ${t('report.redacted', { count: String(report.security.redactedHits) })}`);
+  lines.push('');
+  lines.push(`${t('report.file')} ${report.file.name} (${formatBytes(report.file.sizeBytes)})`);
+  for (const w of report.warnings) lines.push(`  ⚠ ${w}`);
+  return lines.join('\n');
+}
+
+/* ---------------- §22 导入报告 ---------------- */
+
+/** 从 itemId 前缀推断所属分区（与 adapters id 规则对齐；未知归 'other'） */
+export function sectionFromItemId(itemId: string): SectionId | 'other' {
+  if (itemId.startsWith('settings:')) return 'settings';
+  if (itemId.startsWith('ui:')) return 'ui';
+  if (itemId.startsWith('provider:')) return 'providers';
+  if (itemId.startsWith('plugin:') || itemId.startsWith('patch:')) return 'plugins';
+  if (itemId.startsWith('mcp:')) return 'mcp';
+  if (itemId.startsWith('prompt:')) return 'prompts';
+  if (itemId.startsWith('workspace:')) return 'workspaces';
+  if (itemId.startsWith('secret:')) return 'credentialsStatus';
+  if (itemId.startsWith('skills:')) return 'skills';
+  if (itemId.startsWith('agentPresets:')) return 'agentPresets';
+  if (itemId.startsWith('agentInstructions:')) return 'agentInstructions';
+  if (itemId.startsWith('pluginFiles:')) return 'pluginFiles';
+  if (itemId.startsWith('sessions:')) return 'sessions';
+  return 'other';
+}
+
+/** 按分区聚合执行结果（统计 + 明细） */
+export function importSectionStats(executed: readonly ExecutedItem[]): ImportSectionStat[] {
+  const bySection = new Map<string, ImportSectionStat>();
+  for (const e of executed) {
+    const section = sectionFromItemId(e.itemId);
+    let stat = bySection.get(section);
+    if (!stat) {
+      stat = { section: section as SectionId, ok: 0, skipped: 0, warned: 0, failed: 0, items: [] };
+      bySection.set(section, stat);
+    }
+    if (e.status === 'ok') stat.ok += 1;
+    else if (e.status === 'skipped') stat.skipped += 1;
+    else if (e.status === 'warning') stat.warned += 1;
+    else stat.failed += 1;
+    stat.items.push(e);
+  }
+  return [...bySection.values()];
+}
+
+/** 导入结果总数（跨分区合计口径；结果页顶部「总览」徽章用，替代逐分区 `settings: 6✓ 12≈` 天书）。 */
+export interface ImportTotals {
+  ok: number;
+  skipped: number;
+  warned: number;
+  failed: number;
+  /** 需要用户关注的项数 = 警告 + 失败（跳过是「按预期未写」，不算问题）。 */
+  problems: number;
+}
+
+/** 汇总 executed 的总数（与 importSectionStats 同源口径：ok / skipped / warning / failed）。 */
+export function importTotals(executed: readonly ExecutedItem[]): ImportTotals {
+  const totals: ImportTotals = { ok: 0, skipped: 0, warned: 0, failed: 0, problems: 0 };
+  for (const e of executed) {
+    if (e.status === 'ok') totals.ok += 1;
+    else if (e.status === 'skipped') totals.skipped += 1;
+    else if (e.status === 'warning') totals.warned += 1;
+    else totals.failed += 1;
+  }
+  totals.problems = totals.warned + totals.failed;
+  return totals;
+}
+
+/** 结果页「需要你关注」清单条目（失败 / 警告项 + 所属分区）。 */
+export interface ImportProblem {
+  section: SectionId | 'other';
+  itemId: string;
+  status: 'failed' | 'warning';
+  message?: string;
+}
+
+/**
+ * 跨分区抽出失败 / 警告项（保持执行顺序）。
+ *
+ * 为什么需要：原先这些项的原因只以纯文本行埋在 `renderImportReport` 的等宽块里
+ * （`  说明: 插件 x 安装失败…`），用户看到「⚠ 5 需要注意」却不知道是哪 5 个；结构化
+ * 清单直接把「哪一项 + 什么原因」摆出来。
+ */
+export function importProblems(executed: readonly ExecutedItem[]): ImportProblem[] {
+  const out: ImportProblem[] = [];
+  for (const e of executed) {
+    if (e.status !== 'failed' && e.status !== 'warning') continue;
+    out.push({
+      section: sectionFromItemId(e.itemId),
+      itemId: e.itemId,
+      status: e.status,
+      ...(e.message !== undefined ? { message: e.message } : {}),
+    });
+  }
+  return out;
+}
+
+/** 导入报告渲染（含回滚状态；§22 动作按钮由 suggestedActions 给出） */
+export function renderImportReport(result: ImportResult, t: UiT): string {
+  const lines: string[] = [result.ok ? t('report.importComplete') : t('report.importFailed'), ''];
+  // F4：被删除墓碑过滤的条目提示（用户明确删过、不复活）
+  if ((result.skippedTombstoned?.length ?? 0) > 0) {
+    lines.push(t('report.tombstonedSkipped', { count: String(result.skippedTombstoned!.length) }));
+    lines.push('');
+  }
+  const stats = importSectionStats(result.executed);
+  for (const s of stats) {
+    const parts: string[] = [];
+    if (s.ok > 0) parts.push(`✓ ${s.ok} ${t('report.importedRestored')}`);
+    if (s.skipped > 0) parts.push(`- ${s.skipped} ${t('report.skipped')}`);
+    if (s.warned > 0) parts.push(`⚠ ${s.warned} ${t('report.needAttention')}`);
+    if (s.failed > 0) parts.push(`✗ ${s.failed} ${t('report.failed')}`);
+    lines.push(`${s.section}: ${parts.join(' ') || t('report.noChanges')}`);
+    // 失败/警告项给出可操作原因（§23）
+    for (const it of s.items) {
+      if (it.status === 'failed' || it.status === 'warning') {
+        lines.push(`  ${it.status === 'failed' ? t('report.reason') : t('report.note')}: ${it.message ?? t('report.unknownReason')}`);
+      }
+    }
+  }
+  if (result.missingSecrets.length > 0) {
+    lines.push(`${t('report.secrets')} ⚠ ${t('report.credentialsNeedEntry', { count: String(result.missingSecrets.length) })}`);
+  }
+  if (result.needsRestart) {
+    lines.push(t('report.restartPluginsMcp'));
+  }
+  for (const w of result.warnings) lines.push(`⚠ ${w}`);
+  if (result.rollback) {
+    lines.push('');
+    lines.push(renderRollbackReport(result.rollback, t));
+  }
+  return lines.join('\n');
+}
+
+/** 结果页动作按钮（§22）。报告已内联展示全部失败/警告项的原因与回滚详情（§23），
+ * 不再提供空操作的 Fix Issues / View Details 按钮——仅保留「完成」。 */
+export function suggestedActions(_result: ImportResult): ImportResultAction[] {
+  return ['done'];
+}
+
+/* ---------------- §17 回滚报告 ---------------- */
+
+/** 回滚报告渲染（full / partial + 人工恢复清单） */
+export function renderRollbackReport(rr: RollbackReport, t: UiT): string {
+  if (rr.full) {
+    return t('report.rollbackFull');
+  }
+  const lines = [t('report.rollbackPartial')];
+  lines.push(t('report.rollbackManual'));
+  for (const f of rr.failed) {
+    lines.push(`  - ${f.item}: ${f.reason}${f.manualHint ? ` (${f.manualHint})` : ''}`);
+  }
+  if (rr.restored.length > 0) lines.push(t('report.restored', { count: String(rr.restored.length) }));
+  return lines.join('\n');
+}
+
+/* ---------------- 工具 ---------------- */
+
+export function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}

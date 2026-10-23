@@ -1,0 +1,313 @@
+/**
+ * 核心领域类型（Export Schema v1 的纯类型定义）。
+ *
+ * 对齐 Docs/design/architecture.md §13.1 —— m3/m5 的共同契约。
+ * 本文件只含与 DSH 运行时无关的纯数据形状；DSH Service 门面类型见 src/core/types.ts。
+ */
+
+/** 运行平台（等价 NodeJS.Platform，但保持类型自包含，可在浏览器侧引用） */
+export type Platform =
+  | 'win32' | 'darwin' | 'linux' | 'freebsd' | 'openbsd' | 'aix' | 'sunos'
+  | 'android' | 'cygwin' | 'haiku' | 'netbsd' | 'other';
+
+/**
+ * 分区标识，与 ZIP 目录结构、manifest.sections 键一一对应。
+ * 明确不实现的分区（keybindings/workflows/commands）不在此列；
+ * rules 已由 agentInstructions（~/.dsh/AGENTS.md，dsh-agent-instructions 全局指令）承接。
+ */
+export type SectionId =
+  | 'settings' | 'ui' | 'providers' | 'plugins' | 'mcp' | 'prompts'
+  | 'skills' | 'agentPresets' | 'agentInstructions' | 'workspaces' | 'pluginFiles'
+  | 'credentialsStatus' | 'secrets' | 'sessions' | 'self'
+  | 'pluginData' | 'pluginAssets';
+
+/** 加密备份的算法参数（非秘密：salt/iv/authTag 仅用于解密与完整性校验） */
+export interface EncryptionInfo {
+  algorithm: 'aes-256-gcm';
+  kdf: 'scrypt';
+  kdfParams: { N: number; r: number; p: number; keyLength: number };
+  salt: string;   // base64
+  iv: string;     // base64
+  authTag: string;// base64（GCM 认证标签）
+  version: number;
+}
+
+/**
+ * **外部来源包**的溯源块（manifest.foreign，2026-10-18 新增，纯 additive）。
+ *
+ * 为什么需要它：外部来源（Claude Code / Hermes / …）合成的包是**标准 bundle v1**，
+ * 落盘后与 DSH 自产备份**逐字同构** —— 事后无法复核「这包从哪来」。本块把来源标识、
+ * 读取位置、项目根、插件元数据与跳过聚合写进 manifest，供用户与界面核对。
+ *
+ * 三条纪律（与 src/foreign/types.ts 的 ForeignOrigin 同口径）：
+ *  ① **只放标识与计数，绝不放值**（凭据只有引用名，诊断只有机器码，无一字配置内容）；
+ *  ② 向后兼容：旧包没有该字段 ⇒ 缺省即合法；本字段的存在**绝不能**让旧/新包被拒；
+ *  ③ 缺字段即「不知道」，绝不填默认值假装知道。
+ */
+export interface ManifestForeignOrigin {
+  /** 来源 agent id（稳定机器标识，如 claude-code / hermes；不随文案变化） */
+  agent: string;
+  /** 实际读取的位置（相对 home 的 POSIX 路径；不含任何值） */
+  locations?: string[];
+  /** 来源侧版本标记（读不到即省略） */
+  sourceVersion?: string;
+  /** 被扫描的项目根绝对路径（仅溯源，供用户核对；绝不进任何分区载荷） */
+  projects?: string[];
+  /** 插件清单（名称 / 版本 / 市场 / 来源仓库 / ref / 组件种类；**不含凭据**） */
+  plugins?: {
+    name: string;
+    version?: string;
+    marketplace?: string;
+    repo?: string;
+    ref?: string;
+    components?: string[];
+  }[];
+  /** 跳过与诊断汇总（机器码 + 条数，**不含任何值**） */
+  skipped?: { code: string; count: number }[];
+  /** 需要用户在目标机补录的凭据引用名（只有名字，**没有任何值**） */
+  credentialRefs?: string[];
+}
+
+/** 每个导出 ZIP 根部的 manifest.json */
+export interface Manifest {
+  schemaVersion: number;
+  exporter: { name: string; version: string };
+  source: { dshVersion: string; platform: Platform; arch: string };
+  exportedAt: string; // ISO-8601 UTC
+  /**
+   * **导出机的 DSH home 绝对路径**（如 /opt/dsh/.dsh、C:\Users\x\.dsh）；旧包没有这个字段。
+   *
+   * 用途：跨机导入时**自动重定基** —— 备份里位于「导出机基础路径」之下的绝对路径（会话首帧 cwd、
+   * 工作区 path、mcp cwd…）一律改成「本机基础路径 + 同一后缀」。基础路径是机器身份、本机可精确
+   * 得知，因此比让用户手填自由前缀映射更安全可控；用户映射仍在其后依次生效（可覆盖本规则）。
+   *
+   * 宽容读取：非字符串/缺失一律按「未知」处理（不重定基，不报错）。
+   */
+  sourceHome?: string;
+  /**
+   * **外部来源包的溯源块**（见 ManifestForeignOrigin）；DSH 自产备份没有该字段。
+   *
+   * 宽容读取：缺省 = 旧包（合法）；存在但形状/字段类型不对 = 仅 warning（绝不因此拒绝导入）。
+   */
+  foreign?: ManifestForeignOrigin;
+  sections: Record<SectionId, boolean>;
+  security: {
+    containsSecrets: boolean;
+    encrypted: boolean;
+    encryption: EncryptionInfo | null;
+  };
+}
+
+/* —— settings / ui 分区 —— */
+
+/** settings.yaml 中单个 namespace 的导出记录（redacted 值 + 乐观锁 revision） */
+export interface NamespaceRecord {
+  value: unknown;
+  base?: unknown;
+  revision: number;
+  applies?: string[];
+  /** DSH describe({redactSecrets:true}) 报告的 secrets 位置（只含路径标记，不含值） */
+  secrets: { path: string[]; set: boolean }[];
+}
+
+export interface SettingsSection { version: 1; namespaces: Record<string, NamespaceRecord>; }
+
+export interface UiMigrationNote {
+  plugin: string;
+  storage: string;
+  key: string;
+  migratable: false;
+  reason: string;
+}
+
+export interface UiSection {
+  version: 1;
+  namespaces: Record<string, NamespaceRecord>;
+  /** localStorage 等 Host 不可迁移项的说明（纯说明，不含任何值） */
+  uiMigrationNotes: UiMigrationNote[];
+}
+
+/* —— providers 分区 —— */
+
+export interface ProviderEntry {
+  route: string;
+  apiKeyEnv?: string; // 只记环境变量名，值在 credentials
+  displayName?: string;
+  baseURL?: string;
+  models?: unknown[];
+  modelOverrides?: unknown;
+  reasoning?: unknown;
+  transport?: unknown;
+  retryPolicy?: unknown;
+}
+
+export interface ProvidersSection { version: 1; providers: Record<string, ProviderEntry>; }
+
+/* —— plugins 分区 —— */
+
+export interface PluginEntry {
+  name: string;     // 包名
+  version: string;
+  /**
+   * 声明依赖 spec（profile package.json dependencies 原样），如 ^0.3.6、
+   * github:csyangwen/dsh-memory-evolve、file:/link: 等。
+   * 导入时的安装目标由 `core/plugin-cli.ts` 的 `pluginInstallTarget()` 统一推导（issue #101）：
+   * 非 registry 来源按此 spec 原样安装；`version` 是具体 semver 时按 `<name>@<version>` 精确安装；
+   * 其余 spec 按 `<name>@<spec>`；都没有才退回裸包名（npm 最新版）。
+   */
+  spec?: string;
+  /**
+   * 该层只在 profile 的 `dsh.profile.bundles` 里声明、`dependencies` 里没有它，且该 profile 的
+   * `node_modules` 里也**没有**它的落盘副本（issue #95，导出侧写入）。
+   *
+   * 语义：这不是一个「装在本 profile 里的包」，而是由 DSH 从**自己的安装位置**解析的层
+   * （与 `boot-safety.ts` / `RESCUE_KEEP_BUNDLE_PREFIXES` 同口径）。导入端对这类条目
+   * **只把名字声明进目标机的 `dsh.profile.bundles`，绝不走 npm 安装通道**——按裸包名安装会让
+   * 目标机拿到 `dist-tags.latest` 的副本（2026-10 真机：host 0.2.1-rc.2 + 包 0.2.1-alpha.2
+   * → session-controller 一直 pending → 新建会话 service-unavailable）。
+   *
+   * 缺省（旧备份没有该字段）= 由 `spec` / `version` 形状推断，见
+   * `src/core/plugin-cli.ts` 的 `isBundlesOnlyEntry`。
+   */
+  bundlesOnly?: boolean;
+  isBundle: boolean;
+  inBundles: string[];
+  enabled: boolean;
+  fiberPhase?: string;
+}
+
+export interface PatchLine { file: string; lineId: string; raw: unknown; }
+
+/**
+ * 本地源插件的打包产物（T1）。
+ *
+ * 为什么放在 `plugins` 分区内（而非 `plugin-files/` 前缀）：
+ * plugins 是 `defaultIncluded=true` 且 portable，而 pluginFiles 是 `deviceSpecific`
+ * 且 defaultIncluded=false —— 后者会让「快速导出」（默认路径）拿不到 tarball，
+ * 而「本地插件换机丢失」恰恰是最需要默认覆盖的场景。
+ *
+ * 为什么不新增分区 id：新增 SectionId 需同步 SectionId 联合 + section-registry 注册 +
+ * 该分区 adapter 三处（t29 起分区集合由 `schema/section-registry.ts` 唯一派生，
+ * 历史那 7~9 处清单抄写已收敛）；本字段落在既有 plugins 分区内即可被全部既有机制正确处理。
+ *
+ * 安全：base64 仅为传输编码，不做任何执行；导入端只把解包出的 tgz 交给官方
+ * `dsh plugin add` 通道。**市场侧已在发布与导入两端同时拒绝携带本字段的条目**
+ * （`market/prepare.ts` 6b3 + `market/security.ts`）——因为 tarball 是不可经公开仓库审阅的
+ * 不透明二进制，安装时可能执行 postinstall，等于给「分享配置」开一条携带任意代码、
+ * 绕过 BANNED 分区的通道。本地插件迁移只应发生在自己的备份里。
+ */
+export interface LocalPluginTarball {
+  /** 包名（与 PluginEntry.name 对应） */
+  packageName: string;
+  /** 打包时的插件版本 */
+  version: string;
+  /** 归档内相对路径（`local-plugins/<x>.tgz`，恒正斜杠） */
+  relativePath: string;
+  /** tarball 字节的 base64（非秘密；仅本地源插件的源码包） */
+  base64: string;
+}
+
+/**
+ * profile 的 `patches/**` 文件（issue #35）：pnpm-workspace.yaml 的 `patchedDependencies`
+ * 引用的补丁文件本身。声明与文件必须同进同出——只搬声明会让目标机的 pnpm 拒绝一切 `add`
+ * （`Failed to read patch file ... os error 2`）。
+ */
+export interface PnpmPatchFile {
+  /** 相对 **profile 目录** 的路径（如 `patches/dsh-approval-gate.patch`，恒正斜杠） */
+  relativePath: string;
+  /** 文件字节的 base64（patch 是纯文本、非秘密；仅为传输编码） */
+  base64: string;
+}
+
+export interface PluginsSection {
+  version: 1;
+  plugins: PluginEntry[];
+  patch: PatchLine[];
+  /**
+   * profile 的 pnpm-workspace.yaml 原文（allowBuilds / minimumReleaseAgeExclude /
+   * nodeLinker 等）。随插件分区迁移，保证目标 profile 的 pnpm 能按来源配置安装
+   * （git 插件构建脚本白名单、新发布版本冷静期等）。缺省/无文件为 null。
+   */
+  pnpmWorkspace?: string | null;
+  /**
+   * 本地源（`link:` / `file:`）插件的打包产物（T1）。缺省/无本地源插件 = 不出现。
+   * 导出时由宿主注入的打包钩子填充；导入时据此把 spec 重写为 `file:<解包后的绝对路径>`。
+   */
+  localTarballs?: LocalPluginTarball[];
+  /**
+   * `patchedDependencies` 引用的 patch 文件（issue #35）。缺省 = 无声明或无文件可收集。
+   * 导入端先落文件、再写（已剔除不可满足声明的）pnpm-workspace.yaml。
+   */
+  patchFiles?: PnpmPatchFile[];
+}
+
+
+/* —— mcp 分区 —— */
+
+export interface McpServerEntry {
+  serverName: string;
+  type: 'stdio' | 'streamable-http';
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+  url?: string;
+  headers?: Record<string, string>;
+}
+
+export interface McpSection { version: 1; servers: McpServerEntry[]; }
+
+/* —— prompts 分区 —— */
+
+export interface PromptEntry {
+  id: string;
+  name: string;
+  kind: 'systemPrompt' | 'planMode';
+  text: string;
+  sourceLineId?: string;
+}
+
+export interface PromptsSection { version: 1; prompts: PromptEntry[]; }
+
+/* —— workspaces 分区（绝对路径 → 跨设备必须路径映射） —— */
+
+export interface WorkspaceRecord {
+  id: string;
+  path: string;
+  title?: string;
+  sessionIds: string[];
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface WorkspacesSection { version: 1; workspaces: WorkspaceRecord[]; }
+
+/* —— credentials 状态分区（永不含值） —— */
+
+export interface CredentialStatus {
+  ref: string;
+  required: boolean;
+  configured: boolean;
+  source?: 'env' | 'file' | 'projectEnv' | 'other';
+  hasValue: boolean; // 普通备份恒 false（值未导出）
+}
+
+export interface CredentialsSection { version: 1; credentials: CredentialStatus[]; }
+
+/* —— 文件类分区（skills/agentPresets/agentInstructions/pluginFiles/sessions） ——
+ * 这些分区以真实文件形式进入 ZIP（custom/skills/… 等），
+ * 内存中统一表示为 FilesSection（ZIP 内不落此 JSON，见 exporter）。 */
+
+export interface FileEntry {
+  relativePath: string;
+  data: Uint8Array;
+  contentHash: string; // SHA-256 hex
+}
+
+export interface FilesSection { version: 1; files: FileEntry[]; }
+
+/** 分区 JSON 文件的统一载荷（schema 校验用） */
+export type SectionData =
+  | SettingsSection | UiSection | ProvidersSection | PluginsSection
+  | McpSection | PromptsSection | WorkspacesSection | CredentialsSection
+  | FilesSection;
